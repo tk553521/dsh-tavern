@@ -10,10 +10,10 @@ SillyTavern / TauriTavern 风格的角色扮演插件，作为 DeepSeek Harness 
 
 | 能力 | 使用的 DSH 机制 |
 |---|---|
-| 聊天与会话 | 一场扮演 = 一个 **DSH 会话**（导演 agent 的 session）。消息、轨迹、持久化、导出全部走 DSH 会话体系，「对话」页也能看到扮演过程 |
+| 聊天与会话 | 一场扮演 = 一个 **DSH 会话**（导演 agent 的 session）。消息、轨迹、持久化、导出全部走 DSH 会话体系；会话**归档隐藏**，只显示在酒馆页内，「对话」页不会出现酒馆记录 |
 | 多 agent | 导演 agent 通过 `ctx.agents` 创建；多 agent 模式下，每个角色是**独立的 DSH agent**（独立会话与记忆），导演用宿主注册的 **`tavern_speak` 工具**（`ctx.tools`）让角色发言 |
 | 角色卡 / 世界书 / 预设 | 存入 DSH 的 **settings 服务**（`ctx.settings`，`$DSH_HOME` 下的持久化文档）；角色头像 PNG 存到 `$DSH_HOME/tavern/avatars/`，settings 只保存相对路径 |
-| 角色扮演提示词 | 创建会话时通过 agent setup 装配：角色卡组成 **system prompt 的 complete section**（`ctx.systemPrompt`） |
+| 角色扮演提示词 | 创建会话时通过 agent setup 装配：角色卡组成 **system prompt 的 persona 槽位**（`deployment:persona`，complete），同名遮蔽预设固定 persona |
 | 世界书注入 | 注册为 agent 的 **动态 prompt context**：每次组装按最近消息做关键词激活（SillyTavern 规则：constant / probability / depth / group / selective） |
 | 开场白 | 以 **session seed**（平衡的 completed-turn 事件序列）写入会话日志 |
 | 前后端通信 | 库管理走 DSH 进程内的 HTTP 插件扩展点（`ctx.webServer` 前缀路由 `/tavern`，由 dsh-host-webserver 提供，非独立端口/进程） |
@@ -22,6 +22,8 @@ SillyTavern / TauriTavern 风格的角色扮演插件，作为 DeepSeek Harness 
 ## 功能
 
 - **酒馆标签**：位于「对话」（order 0）、「轨迹」（order 10）右侧（order 20），会话作用域视图。
+- **会话隔离**：酒馆会话（导演/角色）创建与恢复后自动归档，不显示在「对话」页/工作区，聊天只在酒馆页内进行。
+- **默认极简预设**：酒馆会话默认挂载**「酒馆极简模式」agent 预设**——与 DSH `minimal` 预设同款组合（持久 bash + 编辑器），但开启 `includeRuntimeContext` 以保留世界书等动态注入；预设由插件写入 `$DSH_HOME/.agent-presets/tavern/`（幂等、不覆盖用户编辑）。
 - **人物卡**：导入 SillyTavern / TauriTavern 人物卡 —— PNG 卡（`chara`/`ccv3` tEXt 块，Base64 编码）与 JSON 卡（v1 / v2 / v3），编辑角色设定，导出 PNG 卡，头像提取。
 - **世界书**：导入/导出 ST 世界书 JSON（entries 为对象或数组均可），条目编辑（关键词、内容、常驻、启用），扮演时按关键词自动激活注入。
 - **预设**：导入/导出 ST 预设 JSON（temp、top_p、rep_pen、max_tokens 等映射到 DSH 模型路由与采样参数）。
@@ -53,8 +55,9 @@ dsh plugin --profile web add <本插件目录>
 2. **世界书**：导入世界书 JSON（可选）。
 3. **预设**：导入 ST 预设 JSON（可选）。
 4. **会话**：在「酒馆 → 会话」勾选登场角色，可选择一本或多本世界书（按选择顺序合并注入）与预设，勾选「多 agent 模式」与「叙述者」，点击「开始扮演」。
-   - 插件会创建一个 DSH 会话（导演），开场白已写入会话日志。
-   - 在酒馆页或「对话」页与角色对话；多 agent 模式下导演会自动调用 `tavern_speak` 让角色以自身性格回应。
+   - 插件会创建一个 DSH 会话（导演），开场白已写入会话日志；会话默认挂载**「酒馆极简模式」agent 预设**（极简组合 + 开启动态注入），并在启动时自动写入 `$DSH_HOME/.agent-presets/tavern/`（可自由编辑）。
+   - 酒馆会话会**归档隐藏**：不显示在「对话」页/工作区，只在酒馆页内聊天。
+   - 在酒馆页与角色对话；多 agent 模式下导演会自动调用 `tavern_speak` 让角色以自身性格回应。
 5. 会话记录、轨迹、导出等全部是标准 DSH 会话能力。
 
 ## 数据格式兼容
@@ -83,3 +86,6 @@ dsh plugin --profile web add <本插件目录>
 - 世界书激活使用最近 12 条消息的文本扫描（与 ST 的 scan depth 语义近似），
   高级 ST 选项（vectorized、正则键、分组轮换等）部分保留字段但未完全实现语义。
 - 角色卡中的 `mes_example` 暂未注入提示词（作为后续增强）。
+- 「酒馆极简模式」预设由插件写入用户预设目录；若部署关闭用户预设根
+  （agent-presets `includeUserRoot: false`）或预设被删除导致挂载失败，新建剧本会失败
+  （旧剧本恢复不受影响，仅记录告警）。

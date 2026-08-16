@@ -580,7 +580,7 @@ export function ChatPanel(props: ChatPanelProps) {
                 </button>
               </div>
               <div className={css.modeRow}>
-                <span>聊天通过 DSH 会话进行：回复会记录在会话日志（轨迹）中，也可在「对话」页查看。</span>
+                <span>聊天通过 DSH 会话进行：回复会记录在会话日志（轨迹）中；酒馆会话只显示在本页，不会出现在「对话」页。</span>
               </div>
             </div>
           </>

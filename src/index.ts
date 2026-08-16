@@ -17,9 +17,12 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type Schema from '@deepseek-ai/schemastery'
 import type { AgentRegistry } from '@deepseek-ai/dsh-agent'
+import type { AgentPresets } from '@deepseek-ai/dsh-agent-presets'
 import type { WebServer } from '@deepseek-ai/dsh-host-webserver'
 import type { SettingsNamespace, SettingsScope } from '@deepseek-ai/dsh-settings'
+import type SessionPersistence from '@deepseek-ai/dsh-session-persistence'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
+import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { TavernStorage, EMPTY_DATABASE, type TavernDatabase } from './storage.ts'
@@ -27,6 +30,7 @@ import { AvatarStore } from './avatarstore.ts'
 import { tavernHandler } from './api.ts'
 import { importTauriTavernData } from './tauritavern.ts'
 import { TavernSessionRuntime } from './play.ts'
+import { ensureTavernPreset } from './tavern-preset.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -47,6 +51,9 @@ export const inject = [
   'agentDefaultModel',
   'tools',
   'dshHomePath',
+  'agentPresets',
+  'workspaceRegistry',
+  'sessionPersistence',
 ]
 
 /** The settings namespace brand for the tavern document. */
@@ -83,6 +90,21 @@ export const TavernSchema = Object.assign(
 ) as unknown as Schema<TavernDatabase>
 
 /**
+ * Run one async factory at most once per process; a rejection clears the
+ * memo so the next caller retries.
+ */
+function memoize<T>(factory: () => Promise<T>): () => Promise<T> {
+  let pending: Promise<T> | undefined
+  return () => {
+    pending ??= factory().catch((error: unknown) => {
+      pending = undefined
+      throw error
+    })
+    return pending
+  }
+}
+
+/**
  * The tavern service: library CRUD and the session runtime. The browser
  * talks to the REST route; other host plugins may use this service directly.
  */
@@ -100,9 +122,16 @@ export class TavernService {
     this.ctx = ctx
     this.storage = new TavernStorage(settingsScope)
     this.avatars = avatars
+    // Author the tavern agent preset once per process; failures surface (and
+    // retry) when a play session is assembled.
+    const ensurePreset = memoize(() => ensureTavernPreset(ctx.dshHomePath))
     this.runtime = new TavernSessionRuntime({
       storage: this.storage,
       agents: ctx.agents,
+      agentPresets: ctx.agentPresets,
+      workspace: ctx.workspaceRegistry,
+      sessionPersistence: ctx.sessionPersistence,
+      ensurePreset,
       defaultModel: () => {
         const selection = ctx.agentDefaultModel.currentSelection()
         return {
@@ -220,6 +249,13 @@ export function apply(ctx: Context): void {
   const avatars = new AvatarStore(ctx.dshHomePath('tavern', 'avatars'), ctx.logger)
   const service = new TavernService(ctx, scope, avatars)
   ctx.provide('tavern', service)
+
+  // Author the tavern agent preset into the harness home up front (idempotent,
+  // non-clobbering); the session runtime re-ensures it before each play
+  // assembly and fails loudly there if it cannot be composed.
+  void ensureTavernPreset(ctx.dshHomePath).catch((error: unknown) => {
+    ctx.logger.warn('tavern: agent preset authoring failed: %s', String(error))
+  })
 
   // Legacy installs stored avatars as base64 data URLs inside settings.yaml.
   // Extract those files once; retrying is safe because unchanged records are

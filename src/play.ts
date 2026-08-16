@@ -17,12 +17,27 @@
 
 import type { LoggerService } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AgentRegistry, AgentSetup } from '@deepseek-ai/dsh-agent'
+import type { AgentPresets } from '@deepseek-ai/dsh-agent-presets'
 import type { MessageId, UserMessage } from '@deepseek-ai/dsh-llm'
-import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
+import type SessionPersistence from '@deepseek-ai/dsh-session-persistence'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
+import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
 import type { CharacterRecord, Play, Preset, WorldBookRecord } from './types.ts'
 import { TavernStorage, newId } from './storage.ts'
 import { activateBook, renderWorldInfo, type ActivatedEntry } from './lorebook.ts'
+import { TAVERN_PRESET_ID } from './tavern-preset.ts'
+
+/**
+ * The system-prompt persona slot the tavern director/character prompts take
+ * over. Mirrors `PERSONA_SECTION`/`PERSONA_ORDER` from dsh-system-prompt
+ * (hardcoded to keep the host half free of @deepseek-ai runtime imports):
+ * registering under this name shadows the preset persona in the agent scope,
+ * so the tavern prompt and the preset's fixed persona never fight over the
+ * complete-section slot.
+ */
+const PERSONA_SECTION = 'deployment:persona'
+const PERSONA_ORDER = 0
 
 /** Resolve the effective world-book ids for a play (new array field + legacy scalar field). */
 export function playLorebookIds(play: Pick<Play, 'lorebookIds' | 'lorebookId'>): string[] {
@@ -39,6 +54,14 @@ import { buildCharacterSystem, buildClassicSystem, characterProfile, stripPrompt
 export interface PlayRuntimeDeps {
   storage: TavernStorage
   agents: AgentRegistry
+  /** Agent-preset roster: mounts the tavern preset for play sessions. */
+  agentPresets: AgentPresets
+  /** Workspace registry: tavern sessions are archived (hidden from every grouping surface). */
+  workspace: WorkspaceRegistry
+  /** Session persistence: resolves the preset a persisted session was produced under. */
+  sessionPersistence: SessionPersistence
+  /** Author the tavern preset into the harness-home user root (memoized, non-clobbering). */
+  ensurePreset: () => Promise<void>
   /** Default model selection for agents without a preset override. */
   defaultModel: () => { provider: string; model: string; reasoningEffort?: string }
   logger: LoggerService
@@ -120,6 +143,13 @@ function greetingSeed(greeting: string, provider: string, model: string): Sessio
   ]
 }
 
+/** Dynamic world-book context for one play's agent assembly. */
+export type LoreContext = {
+  name: string
+  order: number
+  text: (context: { agent?: Agent }) => string
+} | null
+
 /**
  * The tavern session runtime: owns the director and character agents of
  * every play, keyed by play id, and exposes the `tavern_speak` execution.
@@ -166,7 +196,10 @@ export class TavernSessionRuntime {
    * Assemble (create or resume) the director agent for a play. Idempotent per
    * process: the director's session id is the play-bound DSH session. When
    * the persisted session exists (a previous run), it is resumed so history
-   * survives restarts; otherwise a fresh session is created.
+   * survives restarts; otherwise a fresh session is created. Every play
+   * session runs under the tavern agent preset and is archived so the
+   * workspace browser (「对话」页) never lists it — the play lives inside the
+   * tavern page only.
    */
   async ensureDirector(play: Play): Promise<AgentHandle> {
     const existing = this.directors.get(play.id)
@@ -183,36 +216,43 @@ export class TavernSessionRuntime {
 
     const directorSystem = this.buildDirectorSystem(play, characters, preset)
     const loreContext = this.buildLoreContext(lorebooks, characters)
-    const setup: AgentSetup = (agentCtx) => {
-      agentCtx.systemPrompt.section({
-        name: 'tavern:director',
-        order: -1000,
-        complete: true,
-        text: directorSystem,
-      })
-      if (loreContext !== null) {
-        agentCtx.systemPrompt.context(loreContext)
-      }
-    }
+    // A resumed session keeps the preset its history was produced under (a
+    // legacy play predating the tavern preset has none recorded and resumes
+    // bare, as before); a fresh session composes the tavern preset.
+    await this.deps.ensurePreset()
+    const persistedPreset = await this.persistedPreset(sessionId)
+    const setup = this.sessionSetup(persistedPreset ?? TAVERN_PRESET_ID, directorSystem, loreContext)
 
-    // Resume the persisted session when present; fall back to creation.
     const agentOptions = {
       ...(model.provider === undefined ? {} : { provider: model.provider }),
       ...(model.model === undefined ? {} : { model: model.model }),
       ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),
     }
     let handle: AgentHandle
-    try {
-      handle = await this.deps.agents.resume({
-        resumeSessionId: sessionId,
-        agentOptions,
-        setup,
-      })
-    } catch (error: unknown) {
-      this.deps.logger.warn(`tavern: resume director failed (${String(error)}); creating fresh session`)
+    if (persistedPreset !== undefined) {
+      try {
+        handle = await this.deps.agents.resume({
+          resumeSessionId: sessionId,
+          agentOptions,
+          setup,
+        })
+      } catch (error: unknown) {
+        this.deps.logger.warn(`tavern: resume director failed (${String(error)}); creating fresh session`)
+        handle = await this.deps.agents.create({
+          sessionId,
+          agentOptions,
+          meta: { agentPreset: persistedPreset },
+          setup,
+          ...(play.greeting !== undefined && play.greeting !== ''
+            ? { seed: greetingSeed(play.greeting, model.provider ?? 'default', model.model ?? 'default') }
+            : {}),
+        })
+      }
+    } else {
       handle = await this.deps.agents.create({
         sessionId,
         agentOptions,
+        meta: { agentPreset: TAVERN_PRESET_ID },
         setup,
         ...(play.greeting !== undefined && play.greeting !== ''
           ? { seed: greetingSeed(play.greeting, model.provider ?? 'default', model.model ?? 'default') }
@@ -220,7 +260,93 @@ export class TavernSessionRuntime {
       })
     }
     this.directors.set(play.id, handle)
+    await this.hideFromWorkspace(sessionId)
     return handle
+  }
+
+  /**
+   * The preset a persisted session actually runs, newest selection winning
+   * (mirrors `resolveSessionPreset` from dsh-agent-presets; inlined to keep
+   * the host half free of @deepseek-ai runtime imports).
+   * @param header - the persisted session's creation header.
+   * @param events - the persisted session's event log, oldest first.
+   * @returns the recorded preset id, or undefined for a session composed bare.
+   */
+  private recordedPreset(header: SessionHeader, events: readonly SessionEvent[]): string | undefined {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]
+      if (event?.type === 'agent-preset/selected') return event.data.agentPreset
+    }
+    return header.agentPreset
+  }
+
+  /**
+   * Probe the persisted session for the preset it was produced under.
+   * @param sessionId - the session to probe.
+   * @returns the recorded preset id, or undefined when the session is not
+   * persisted (a fresh play) or has none recorded (legacy).
+   */
+  private async persistedPreset(sessionId: SessionId): Promise<string | undefined> {
+    try {
+      const inspected = await this.deps.sessionPersistence.inspect(sessionId)
+      return this.recordedPreset(inspected.meta, inspected.events)
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Compose one play session's scoped world: mount the session's agent
+   * preset (when it has one), then register the play's own system prompt
+   * into the persona slot and the world-book dynamic context.
+   * @param presetId - preset to mount, or undefined to compose bare (legacy).
+   * @param system - the director/character system prompt text.
+   * @param loreContext - the world-book dynamic context, or null.
+   */
+  private sessionSetup(
+    presetId: string | undefined,
+    system: string,
+    loreContext: LoreContext,
+  ): AgentSetup {
+    return async (agentCtx) => {
+      if (presetId !== undefined) {
+        try {
+          await this.deps.agentPresets.mount(agentCtx, presetId)
+        } catch (error: unknown) {
+          // A resumed session whose preset disappeared must stay usable: the
+          // tavern prompt still installs, the session just runs without the
+          // preset's tool rows. Fresh sessions fail loud instead (see the
+          // create path, which resolves the preset before publishing).
+          this.deps.logger.warn(`tavern: preset "${presetId}" failed to mount (${String(error)}); session runs without it`)
+        }
+      }
+      // The persona slot shadows the preset's fixed persona (nearest scope
+      // wins), so the character-card composition is the single complete
+      // section and the play's prompt never collides with the preset's.
+      agentCtx.systemPrompt.section({
+        name: PERSONA_SECTION,
+        order: PERSONA_ORDER,
+        complete: true,
+        text: system,
+      })
+      if (loreContext !== null) {
+        agentCtx.systemPrompt.context(loreContext)
+      }
+    }
+  }
+
+  /**
+   * Archive one play session: tavern sessions are hidden from every workspace
+   * grouping surface (the 对话 page) and live inside the tavern page only.
+   * Idempotent; failures only log because a play must stay usable.
+   * @param sessionId - the session to hide.
+   */
+  private async hideFromWorkspace(sessionId: SessionId): Promise<void> {
+    try {
+      await this.deps.workspace.archiveSession(sessionId)
+    } catch (error: unknown) {
+      this.deps.logger.warn(`tavern: failed to archive session "${sessionId}": ${String(error)}`)
+    }
   }
 
   /** Compose the director's system prompt. */
@@ -261,7 +387,7 @@ export class TavernSessionRuntime {
   private buildLoreContext(
     lorebooks: readonly WorldBookRecord[],
     characters: readonly CharacterRecord[],
-  ): { name: string; order: number; text: (context: { agent?: Agent }) => string } | null {
+  ): LoreContext {
     if (lorebooks.length === 0) return null
     return {
       name: 'tavern:world',
@@ -396,43 +522,45 @@ export class TavernSessionRuntime {
     )
     const sessionId = `tavern-role-${play.id.slice(0, 8)}-${character.id.slice(0, 8)}` as SessionId
     const loreContext = this.buildLoreContext(lorebooks, characters)
-    const setup: AgentSetup = (agentCtx) => {
-      agentCtx.systemPrompt.section({
-        name: 'tavern:character',
-        order: -1000,
-        complete: true,
-        text: system,
-      })
-      if (loreContext !== null) {
-        agentCtx.systemPrompt.context(loreContext)
-      }
-    }
+    // Same composition rules as the director: resume keeps the recorded
+    // preset (legacy role sessions resume bare), fresh sessions compose the
+    // tavern preset.
+    await this.deps.ensurePreset()
+    const persistedPreset = await this.persistedPreset(sessionId)
+    const setup = this.sessionSetup(persistedPreset ?? TAVERN_PRESET_ID, system, loreContext)
 
-    // Resume the persisted session when present; fall back to creation.
+    const agentOptions = {
+      ...(model.provider === undefined ? {} : { provider: model.provider }),
+      ...(model.model === undefined ? {} : { model: model.model }),
+      ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),
+    }
     let handle: AgentHandle
-    try {
-      handle = await this.deps.agents.resume({
-        resumeSessionId: sessionId,
-        agentOptions: {
-          ...(model.provider === undefined ? {} : { provider: model.provider }),
-          ...(model.model === undefined ? {} : { model: model.model }),
-          ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),
-        },
-        setup,
-      })
-    } catch (error: unknown) {
-      this.deps.logger.warn(`tavern: resume character failed (${String(error)}); creating fresh session`)
+    if (persistedPreset !== undefined) {
+      try {
+        handle = await this.deps.agents.resume({
+          resumeSessionId: sessionId,
+          agentOptions,
+          setup,
+        })
+      } catch (error: unknown) {
+        this.deps.logger.warn(`tavern: resume character failed (${String(error)}); creating fresh session`)
+        handle = await this.deps.agents.create({
+          sessionId,
+          agentOptions,
+          meta: { agentPreset: persistedPreset },
+          setup,
+        })
+      }
+    } else {
       handle = await this.deps.agents.create({
         sessionId,
-        agentOptions: {
-          ...(model.provider === undefined ? {} : { provider: model.provider }),
-          ...(model.model === undefined ? {} : { model: model.model }),
-          ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),
-        },
+        agentOptions,
+        meta: { agentPreset: TAVERN_PRESET_ID },
         setup,
       })
     }
     byPlay.set(character.id, handle)
+    await this.hideFromWorkspace(sessionId)
     return handle
   }
 

@@ -35,6 +35,7 @@
     "src/cardcodec.ts",
     "src/lorebook.ts",
     "src/prompt.ts",
-    "src/tauritavern.ts"
+    "src/tauritavern.ts",
+    "src/tavern-preset.ts"
   ]
 }

@@ -3,8 +3,11 @@ import Schema from "@deepseek-ai/schemastery";
 import { SettingsScope } from "@deepseek-ai/dsh-settings";
 import { dshHomePath } from "@deepseek-ai/dsh-home-paths";
 import { Agent, AgentHandle, AgentRegistry } from "@deepseek-ai/dsh-agent";
+import { AgentPresets } from "@deepseek-ai/dsh-agent-presets";
 import "@deepseek-ai/dsh-session";
+import SessionPersistence from "@deepseek-ai/dsh-session-persistence";
 import { ToolRunContext } from "@deepseek-ai/dsh-tools";
+import { WorkspaceRegistry } from "@deepseek-ai/dsh-workspace";
 //#region src/types.d.ts
 /**
  * dsh-tavern data model: SillyTavern/TauriTavern compatible character cards,
@@ -355,6 +358,14 @@ declare class AvatarStore {
 interface PlayRuntimeDeps {
   storage: TavernStorage;
   agents: AgentRegistry;
+  /** Agent-preset roster: mounts the tavern preset for play sessions. */
+  agentPresets: AgentPresets;
+  /** Workspace registry: tavern sessions are archived (hidden from every grouping surface). */
+  workspace: WorkspaceRegistry;
+  /** Session persistence: resolves the preset a persisted session was produced under. */
+  sessionPersistence: SessionPersistence;
+  /** Author the tavern preset into the harness-home user root (memoized, non-clobbering). */
+  ensurePreset: () => Promise<void>;
   /** Default model selection for agents without a preset override. */
   defaultModel: () => {
     provider: string;
@@ -386,9 +397,44 @@ declare class TavernSessionRuntime {
    * Assemble (create or resume) the director agent for a play. Idempotent per
    * process: the director's session id is the play-bound DSH session. When
    * the persisted session exists (a previous run), it is resumed so history
-   * survives restarts; otherwise a fresh session is created.
+   * survives restarts; otherwise a fresh session is created. Every play
+   * session runs under the tavern agent preset and is archived so the
+   * workspace browser (「对话」页) never lists it — the play lives inside the
+   * tavern page only.
    */
   ensureDirector(play: Play): Promise<AgentHandle>;
+  /**
+   * The preset a persisted session actually runs, newest selection winning
+   * (mirrors `resolveSessionPreset` from dsh-agent-presets; inlined to keep
+   * the host half free of @deepseek-ai runtime imports).
+   * @param header - the persisted session's creation header.
+   * @param events - the persisted session's event log, oldest first.
+   * @returns the recorded preset id, or undefined for a session composed bare.
+   */
+  private recordedPreset;
+  /**
+   * Probe the persisted session for the preset it was produced under.
+   * @param sessionId - the session to probe.
+   * @returns the recorded preset id, or undefined when the session is not
+   * persisted (a fresh play) or has none recorded (legacy).
+   */
+  private persistedPreset;
+  /**
+   * Compose one play session's scoped world: mount the session's agent
+   * preset (when it has one), then register the play's own system prompt
+   * into the persona slot and the world-book dynamic context.
+   * @param presetId - preset to mount, or undefined to compose bare (legacy).
+   * @param system - the director/character system prompt text.
+   * @param loreContext - the world-book dynamic context, or null.
+   */
+  private sessionSetup;
+  /**
+   * Archive one play session: tavern sessions are hidden from every workspace
+   * grouping surface (the 对话 page) and live inside the tavern page only.
+   * Idempotent; failures only log because a play must stay usable.
+   * @param sessionId - the session to hide.
+   */
+  private hideFromWorkspace;
   /** Compose the director's system prompt. */
   private buildDirectorSystem;
   /** Dynamic world-book context for the director's assembly. */
