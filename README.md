@@ -12,7 +12,7 @@ SillyTavern / TauriTavern 风格的角色扮演插件，作为 DeepSeek Harness 
 |---|---|
 | 聊天与会话 | 一场扮演 = 一个 **DSH 会话**（导演 agent 的 session）。消息、轨迹、持久化、导出全部走 DSH 会话体系，「对话」页也能看到扮演过程 |
 | 多 agent | 导演 agent 通过 `ctx.agents` 创建；多 agent 模式下，每个角色是**独立的 DSH agent**（独立会话与记忆），导演用宿主注册的 **`tavern_speak` 工具**（`ctx.tools`）让角色发言 |
-| 角色卡 / 世界书 / 预设 | 存入 DSH 的 **settings 服务**（`ctx.settings`，`$DSH_HOME` 下的持久化文档） |
+| 角色卡 / 世界书 / 预设 | 存入 DSH 的 **settings 服务**（`ctx.settings`，`$DSH_HOME` 下的持久化文档）；角色头像 PNG 存到 `$DSH_HOME/tavern/avatars/`，settings 只保存相对路径 |
 | 角色扮演提示词 | 创建会话时通过 agent setup 装配：角色卡组成 **system prompt 的 complete section**（`ctx.systemPrompt`） |
 | 世界书注入 | 注册为 agent 的 **动态 prompt context**：每次组装按最近消息做关键词激活（SillyTavern 规则：constant / probability / depth / group / selective） |
 | 开场白 | 以 **session seed**（平衡的 completed-turn 事件序列）写入会话日志 |
@@ -60,6 +60,7 @@ dsh plugin --profile web add <本插件目录>
 ## 数据格式兼容
 
 - 人物卡：`chara_card_v2`（默认导出）；读取兼容 v1/v2/v3 与 PNG 嵌入（`ccv3` 优先、`chara` 回退、Base64 值）。
+- 头像：settings 中的 `avatar` 字段保存 `tavern/avatars/<character-id>.png` 相对路径，文件本体位于 `$DSH_HOME/tavern/avatars/`；旧版 base64 内联头像会在插件启动时自动迁移为文件。
 - 世界书：ST 独立世界书（`entries` 为 uid 键对象）与内嵌 `character_book`（entries 数组）均可导入；导出为 ST 世界书文件格式（snake_case `extensions` 元数据镜像）。
 - 预设：ST 各类型预设 JSON 均接受；`custom_model` 映射为 DSH 模型路由。
 - 聊天：对话完全以 DSH 会话日志为准（可用标准导出能力）。

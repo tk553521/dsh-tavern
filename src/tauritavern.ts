@@ -19,6 +19,7 @@ import path from 'node:path'
 import { normalizeCard, normalizeWorldBook, importPreset } from './cardcodec.ts'
 import { parsePngCard } from './png.ts'
 import { newId, nowIso, type TavernStorage } from './storage.ts'
+import type { AvatarStore } from './avatarstore.ts'
 import type {
   CharacterRecord,
   Preset,
@@ -465,6 +466,7 @@ function selected(value: boolean | undefined): boolean {
  */
 export async function importTauriTavernData(
   storage: TavernStorage,
+  avatars: AvatarStore,
   input: string,
   selection: Partial<TauriTavernImportSelection> = {},
 ): Promise<TauriTavernImportReport> {
@@ -495,10 +497,11 @@ export async function importTauriTavernData(
   }
 
   if (categories.characters) {
-    const records = dedupeBySource(
+    const imported = dedupeBySource(
       db.characters,
       await importCharacters(resolved.userDir, path.join(resolved.userDir, 'characters'), issues),
     )
+    const records = await avatars.materializeCharacters(imported)
     await storage.appendCharacters(records)
     report.imported.characters = records.length
   }

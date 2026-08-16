@@ -1,6 +1,7 @@
 import { Context, LoggerService } from "@deepseek-ai/cordis";
 import Schema from "@deepseek-ai/schemastery";
 import { SettingsScope } from "@deepseek-ai/dsh-settings";
+import { dshHomePath } from "@deepseek-ai/dsh-home-paths";
 import { Agent, AgentHandle, AgentRegistry } from "@deepseek-ai/dsh-agent";
 import "@deepseek-ai/dsh-session";
 import { ToolRunContext } from "@deepseek-ai/dsh-tools";
@@ -40,7 +41,11 @@ interface CharacterRecord {
   id: string;
   /** Import source display name (file name or manual). */
   source?: string;
-  /** Avatar as a data URL (extracted from PNG cards or user upload). */
+  /**
+   * Avatar as a data URL (legacy inline) or as a DSH-home-relative file path
+   * (`tavern/avatars/<character-id>.png`).  The client and export route resolve
+   * the path through the `/tavern/avatars/...` HTTP route.
+   */
   avatar?: string;
   /** When this record was created, ISO string. */
   createdAt: string;
@@ -282,6 +287,8 @@ declare class TavernStorage {
   listCharacters(): CharacterRecord[];
   getCharacter(id: string): CharacterRecord | undefined;
   upsertCharacter(record: CharacterRecord): Promise<void>;
+  /** Persist the complete character array (used by avatar-file migration). */
+  replaceCharacters(records: CharacterRecord[]): Promise<void>;
   /** Bulk-append imported character records in a single settings write. */
   appendCharacters(records: CharacterRecord[]): Promise<void>;
   deleteCharacter(id: string): Promise<void>;
@@ -304,6 +311,44 @@ declare class TavernStorage {
   setDefaultPreset(id: string | undefined): Promise<void>;
   /** Persist the tavern view style preference. */
   setStyle(style: TavernStyle): Promise<void>;
+}
+//#endregion
+//#region src/avatarstore.d.ts
+/**
+ * File-backed avatar store.  Persisted paths are always relative to the DSH
+ * home directory so the settings document stays host-independent.
+ */
+declare class AvatarStore {
+  readonly root: string;
+  private readonly logger;
+  constructor(root: string, logger: Pick<LoggerService, 'warn'>);
+  private filePath;
+  private ensureRoot;
+  /**
+   * Replace a character's data-URL avatar with an on-disk file and return the
+   * record that should be persisted.  Records that already use a relative path
+   * (or have no avatar) are returned unchanged.
+   */
+  materializeCharacter(record: CharacterRecord, previous?: CharacterRecord): Promise<CharacterRecord>;
+  /** Materialize every data-URL avatar in one batch (used by the importer). */
+  materializeCharacters(records: CharacterRecord[]): Promise<CharacterRecord[]>;
+  /**
+   * Migrate legacy inline avatars out of the settings document.  A failed file
+   * write keeps the original data URL, so a migration is always safe to retry.
+   */
+  migrateLegacyCharacters(records: CharacterRecord[]): Promise<{
+    characters: CharacterRecord[];
+    changed: number;
+  }>;
+  /** Read a stored avatar for the HTTP route. */
+  read(file: string): Promise<{
+    bytes: Buffer;
+    contentType: string;
+  } | undefined>;
+  /** Read the bytes backing a character record (legacy inline or on-disk). */
+  readCharacter(record: CharacterRecord): Promise<Buffer | undefined>;
+  /** Remove the on-disk avatar for a deleted character. */
+  removeCharacter(record: CharacterRecord): Promise<void>;
 }
 //#endregion
 //#region src/play.d.ts
@@ -377,6 +422,8 @@ declare module '@deepseek-ai/cordis' {
   interface Context {
     /** The tavern service: library CRUD plus play/session assembly. */
     tavern: TavernService;
+    /** Resolves a path under the DSH home (provided by app boot). */
+    dshHomePath: typeof dshHomePath;
   }
 }
 declare const name = "dsh-tavern";
@@ -397,8 +444,9 @@ declare const TavernSchema: Schema<TavernDatabase>;
 declare class TavernService {
   readonly storage: TavernStorage;
   readonly runtime: TavernSessionRuntime;
+  readonly avatars: AvatarStore;
   private readonly ctx;
-  constructor(ctx: Context, settingsScope: SettingsScope<TavernDatabase>);
+  constructor(ctx: Context, settingsScope: SettingsScope<TavernDatabase>, avatars: AvatarStore);
   /** All stored characters. */
   listCharacters(): CharacterRecord[];
   /** All stored world books. */
@@ -412,6 +460,13 @@ declare class TavernService {
    * (portable app root, data root, default-user, or a child directory).
    */
   importTauriTavern(input: string, selection?: Partial<TauriTavernImportSelection>): Promise<TauriTavernImportReport>;
+  /**
+   * One-time (idempotent) migration: extract legacy inline data-URL avatars to
+   * `<dsh-home>/tavern/avatars/` and persist only their relative paths.
+   */
+  migrateLegacyAvatars(): Promise<{
+    changed: number;
+  }>;
   /**
    * Whether the agent-loop factory is currently available.
    * `AgentRegistry` has no public factory probe; the stock agent-loop plugin

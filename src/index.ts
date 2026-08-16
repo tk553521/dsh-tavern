@@ -21,7 +21,9 @@ import type { WebServer } from '@deepseek-ai/dsh-host-webserver'
 import type { SettingsNamespace, SettingsScope } from '@deepseek-ai/dsh-settings'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
+import type { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { TavernStorage, EMPTY_DATABASE, type TavernDatabase } from './storage.ts'
+import { AvatarStore } from './avatarstore.ts'
 import { tavernHandler } from './api.ts'
 import { importTauriTavernData } from './tauritavern.ts'
 import { TavernSessionRuntime } from './play.ts'
@@ -30,6 +32,8 @@ declare module '@deepseek-ai/cordis' {
   interface Context {
     /** The tavern service: library CRUD plus play/session assembly. */
     tavern: TavernService
+    /** Resolves a path under the DSH home (provided by app boot). */
+    dshHomePath: typeof dshHomePath
   }
 }
 
@@ -42,6 +46,7 @@ export const inject = [
   'agents',
   'agentDefaultModel',
   'tools',
+  'dshHomePath',
 ]
 
 /** The settings namespace brand for the tavern document. */
@@ -84,14 +89,17 @@ export const TavernSchema = Object.assign(
 export class TavernService {
   readonly storage: TavernStorage
   readonly runtime: TavernSessionRuntime
+  readonly avatars: AvatarStore
   private readonly ctx: Context
 
   constructor(
     ctx: Context,
     settingsScope: SettingsScope<TavernDatabase>,
+    avatars: AvatarStore,
   ) {
     this.ctx = ctx
     this.storage = new TavernStorage(settingsScope)
+    this.avatars = avatars
     this.runtime = new TavernSessionRuntime({
       storage: this.storage,
       agents: ctx.agents,
@@ -132,7 +140,20 @@ export class TavernService {
    * (portable app root, data root, default-user, or a child directory).
    */
   importTauriTavern(input: string, selection?: Partial<import('./types.ts').TauriTavernImportSelection>) {
-    return importTauriTavernData(this.storage, input, selection)
+    return importTauriTavernData(this.storage, this.avatars, input, selection)
+  }
+
+  /**
+   * One-time (idempotent) migration: extract legacy inline data-URL avatars to
+   * `<dsh-home>/tavern/avatars/` and persist only their relative paths.
+   */
+  async migrateLegacyAvatars(): Promise<{ changed: number }> {
+    const db = this.storage.snapshot()
+    if (db.characters.length === 0) return { changed: 0 }
+    const result = await this.avatars.migrateLegacyCharacters(db.characters)
+    if (result.changed === 0) return result
+    await this.storage.replaceCharacters(result.characters)
+    return result
   }
 
   /**
@@ -196,8 +217,18 @@ export function apply(ctx: Context): void {
   // The tavern database namespace: one JSON document for the whole library.
   const scope = ctx.settings.register<TavernDatabase>(tavernNamespace, TavernSchema)
 
-  const service = new TavernService(ctx, scope)
+  const avatars = new AvatarStore(ctx.dshHomePath('tavern', 'avatars'), ctx.logger)
+  const service = new TavernService(ctx, scope, avatars)
   ctx.provide('tavern', service)
+
+  // Legacy installs stored avatars as base64 data URLs inside settings.yaml.
+  // Extract those files once; retrying is safe because unchanged records are
+  // left alone and any failed record keeps its inline fallback.
+  void service.migrateLegacyAvatars().then(({ changed }) => {
+    if (changed > 0) ctx.logger.info('tavern avatar migration: extracted %s avatar file(s)', String(changed))
+  }).catch((error: unknown) => {
+    ctx.logger.warn('tavern avatar migration failed: %s', String(error))
+  })
 
   // The multi-agent tool: every DSH session (not only tavern plays) sees it,
   // but it only acts inside a play-bound director session.
@@ -212,6 +243,7 @@ export function apply(ctx: Context): void {
     handler: (req, res) => tavernHandler({
       storage: service.storage,
       runtime: service.runtime,
+      avatars: service.avatars,
       logger: ctx.logger,
       multiAgentAvailable: () => service.multiAgentAvailable(),
     }, req, res),

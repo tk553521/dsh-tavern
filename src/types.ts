@@ -38,7 +38,11 @@ export interface CharacterRecord {
   id: string
   /** Import source display name (file name or manual). */
   source?: string
-  /** Avatar as a data URL (extracted from PNG cards or user upload). */
+  /**
+   * Avatar as a data URL (legacy inline) or as a DSH-home-relative file path
+   * (`tavern/avatars/<character-id>.png`).  The client and export route resolve
+   * the path through the `/tavern/avatars/...` HTTP route.
+   */
   avatar?: string
   /** When this record was created, ISO string. */
   createdAt: string

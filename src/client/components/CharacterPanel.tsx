@@ -4,6 +4,7 @@
 import { useRef, useState } from 'react'
 import type { CharacterRecord } from '../../types.ts'
 import { fileToDataUrl, fileToText, type TavernApi } from '../api.ts'
+import { avatarSrc } from '../avatar.ts'
 import css from '../TavernView.module.css'
 import { Button, Empty, Field, Select, TextArea, TextInput, confirmAction } from './common.tsx'
 
@@ -112,7 +113,7 @@ export function CharacterPanel(props: CharacterPanelProps) {
               onClick={() => props.onSelect(character.id)}
             >
               {character.avatar !== undefined
-                ? <img className={css.listItemAvatar} src={character.avatar} alt="" />
+                ? <img className={css.listItemAvatar} src={avatarSrc(character.avatar)} alt="" />
                 : <span className={css.listItemAvatar} />}
               <span className={css.listItemName}>{character.card.data.name}</span>
             </button>
@@ -192,7 +193,7 @@ function CharacterEditor(props: {
       <div className={css.row} style={{ justifyContent: 'space-between' }}>
         <div className={css.row}>
           {props.character.avatar !== undefined
-            ? <img className={css.cardAvatar} src={props.character.avatar} alt="" />
+            ? <img className={css.cardAvatar} src={avatarSrc(props.character.avatar)} alt="" />
             : <span className={css.cardAvatar} />}
           <span className={css.sectionTitle} style={{ border: 'none', padding: 0 }}>
             {data.name}

@@ -6,6 +6,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PlaySummary } from '../../types.ts'
 import type { TavernApi } from '../api.ts'
+import { avatarSrc } from '../avatar.ts'
 import type { ViewMessage } from '../TavernView.tsx'
 import css from '../TavernView.module.css'
 import { Button, Empty, Field, Select, Spinner, confirmAction } from './common.tsx'
@@ -220,7 +221,7 @@ export function ChatPanel(props: ChatPanelProps) {
                 <span className={css.playAvatarStack} aria-hidden="true">
                   {cast.slice(0, 3).map(character => (
                     character.avatar !== undefined
-                      ? <img key={character.id} className={css.playAvatar} src={character.avatar} alt="" />
+                      ? <img key={character.id} className={css.playAvatar} src={avatarSrc(character.avatar)} alt="" />
                       : (
                           <span key={character.id} className={css.playAvatar}>
                             {firstGrapheme(character.name)}
@@ -432,7 +433,7 @@ export function ChatPanel(props: ChatPanelProps) {
                         title={index === 0 ? '当前主角（第 1 位）' : `点击将「${character.name}」设为主角`}
                       >
                         {character.avatar !== undefined
-                          ? <img className={css.castOrderAvatar} src={character.avatar} alt="" />
+                          ? <img className={css.castOrderAvatar} src={avatarSrc(character.avatar)} alt="" />
                           : <span className={css.castOrderAvatar}>{firstGrapheme(character.name)}</span>}
                         <span className={css.castOrderName}>{character.name}</span>
                         <span className={css.castOrderRank}>{index === 0 ? '★ 主角' : `#${index + 1}`}</span>
@@ -476,7 +477,7 @@ export function ChatPanel(props: ChatPanelProps) {
                         >
                           <span className={css.castCardMedia}>
                             {character.avatar !== undefined
-                              ? <img className={css.castCardAvatar} src={character.avatar} alt="" />
+                              ? <img className={css.castCardAvatar} src={avatarSrc(character.avatar)} alt="" />
                               : <span className={css.castCardAvatar}>{firstGrapheme(character.name)}</span>}
                           </span>
                           {isSelected && (

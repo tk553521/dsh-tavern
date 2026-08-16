@@ -72,6 +72,11 @@ export class TavernStorage {
     await this.scope.update({ characters })
   }
 
+  /** Persist the complete character array (used by avatar-file migration). */
+  async replaceCharacters(records: CharacterRecord[]): Promise<void> {
+    await this.scope.update({ characters: records })
+  }
+
   /** Bulk-append imported character records in a single settings write. */
   async appendCharacters(records: CharacterRecord[]): Promise<void> {
     if (records.length === 0) return

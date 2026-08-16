@@ -13,10 +13,12 @@ import { normalizeCard, parseCardInput, avatarDataUrl, normalizeWorldBook, seria
 import { encodePngCard } from './png.ts'
 import { playLorebookIds, TavernSessionRuntime } from './play.ts'
 import { importTauriTavernData } from './tauritavern.ts'
+import type { AvatarStore } from './avatarstore.ts'
 
 export interface TavernApiDeps {
   storage: TavernStorage
   runtime: TavernSessionRuntime
+  avatars: AvatarStore
   logger: LoggerService
   /** Whether the agent-loop factory is currently available (session assembly). */
   multiAgentAvailable: () => boolean
@@ -169,7 +171,7 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
         return sendError(res, 400, '缺少 TauriTavern 目录路径')
       }
       try {
-        const report = await importTauriTavernData(storage, body.path, {
+        const report = await importTauriTavernData(storage, deps.avatars, body.path, {
           characters: typeof body.characters === 'boolean' ? body.characters : undefined,
           lorebooks: typeof body.lorebooks === 'boolean' ? body.lorebooks : undefined,
           presets: typeof body.presets === 'boolean' ? body.presets : undefined,
@@ -178,6 +180,19 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
       } catch (error) {
         return sendError(res, 400, error instanceof Error ? error.message : String(error))
       }
+    }
+
+    // ── stored avatar files ──
+    if (seg[1] === 'avatars' && seg.length === 3 && method === 'GET') {
+      const avatar = await deps.avatars.read(seg[2]!)
+      if (avatar === undefined) return sendError(res, 404, '头像不存在')
+      res.writeHead(200, {
+        'content-type': avatar.contentType,
+        'content-length': avatar.bytes.length,
+        'cache-control': 'private, max-age=3600',
+      })
+      res.end(avatar.bytes)
+      return
     }
 
     // ── characters ──
@@ -200,8 +215,9 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
             updatedAt: nowIso(),
             card,
           }
-          await storage.upsertCharacter(record)
-          return sendJson(res, 201, record)
+          const stored = await deps.avatars.materializeCharacter(record)
+          await storage.upsertCharacter(stored)
+          return sendJson(res, 201, stored)
         }
         if (input === undefined || input.trim() === '') return sendError(res, 400, '缺少卡片输入')
         const bytes = typeof body.input === 'string' && body.input.startsWith('data:')
@@ -217,8 +233,9 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
           updatedAt: nowIso(),
           card,
         }
-        await storage.upsertCharacter(record)
-        return sendJson(res, 201, record)
+        const stored = await deps.avatars.materializeCharacter(record)
+        await storage.upsertCharacter(stored)
+        return sendJson(res, 201, stored)
       }
       if (seg.length === 3 && method === 'PUT') {
         const body = (await readJsonBody(req)) as Record<string, unknown> | undefined
@@ -235,19 +252,21 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
           card,
           updatedAt: nowIso(),
         }
-        await storage.upsertCharacter(updated)
-        return sendJson(res, 200, updated)
+        const stored = await deps.avatars.materializeCharacter(updated, existing)
+        await storage.upsertCharacter(stored)
+        return sendJson(res, 200, stored)
       }
       if (seg.length === 3 && method === 'DELETE') {
+        const existing = storage.getCharacter(seg[2]!)
+        if (existing === undefined) return sendError(res, 404, '角色不存在')
         await storage.deleteCharacter(seg[2]!)
+        await deps.avatars.removeCharacter(existing)
         return sendJson(res, 200, { ok: true })
       }
       if (seg.length === 4 && seg[3] === 'export' && method === 'GET') {
         const character = storage.getCharacter(seg[2]!)
         if (character === undefined) return sendError(res, 404, '角色不存在')
-        const avatar = character.avatar !== undefined && character.avatar.startsWith('data:image/png')
-          ? Buffer.from(character.avatar.split(',')[1] ?? '', 'base64')
-          : undefined
+        const avatar = await deps.avatars.readCharacter(character)
         const png = encodePngCard(JSON.stringify(character.card), avatar)
         const name = character.card.data.name.replace(/[\\/:*?"<>|]/g, '_') || 'character'
         res.writeHead(200, {
