@@ -1,0 +1,58 @@
+{
+  "name": "dsh-tavern",
+  "version": "0.1.0",
+  "description": "DSH 酒馆：SillyTavern 风格角色扮演插件 —— 世界书 / 预设 / 人物卡 + 多 agent 扮演",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit -p tsconfig.host.json && tsc --noEmit -p tsconfig.client.json",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "dsh",
+    "plugin",
+    "tavern",
+    "sillytavern",
+    "角色扮演"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "~18.3.1",
+    "@types/react-dom": "~18.3.0",
+    "lightningcss": "^1.30.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "tsdown": "^0.22.14",
+    "typescript": "^5.9.0"
+  }
+}

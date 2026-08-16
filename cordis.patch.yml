@@ -1,0 +1,7 @@
+# dsh-tavern bundle patch: insert the tavern plugin row into the config tree.
+# The row's package declares both dsh.bundle (this layer) and dsh.client
+# (browser half scanned into window.__DSH_BOOT__ by dsh-client-modules), so one
+# row carries the host plugin and the browser UI.
+- insert:
+    - id: tavern
+      name: dsh-tavern

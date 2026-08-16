@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Local reference checkouts
+.ref/
+
+# Local DSH runtime dumps and import scratch files
+state*.json
+state*.meta
+import_*.json
+import_*.meta
+import_*.pid
+*.pid
+*.log
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.tmp

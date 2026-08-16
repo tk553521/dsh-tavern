@@ -1,0 +1,40 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": [
+      "ES2022"
+    ],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "noImplicitAny": true,
+    "noUncheckedIndexedAccess": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": [
+      "node"
+    ],
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "paths": {
+      "@deepseek-ai/*": [
+        "C:/Users/lthwc/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/*"
+      ]
+    }
+  },
+  "include": [
+    "src/index.ts",
+    "src/api.ts",
+    "src/play.ts",
+    "src/storage.ts",
+    "src/types.ts",
+    "src/png.ts",
+    "src/cardcodec.ts",
+    "src/lorebook.ts",
+    "src/prompt.ts",
+    "src/tauritavern.ts"
+  ]
+}

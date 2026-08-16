@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "noImplicitAny": true,
+    "noUncheckedIndexedAccess": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true,
+    "jsx": "react-jsx",
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"],
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "paths": {
+      "@deepseek-ai/*": [
+        "C:/Users/lthwc/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/*"
+      ]
+    }
+  },
+  "include": ["src/client", "src/types.ts", "src/css-modules.d.ts"]
+}
