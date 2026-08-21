@@ -1,14 +1,16 @@
 /**
  * Tavern view: the conversation-view entry the tavern plugin registers.
- * The chat area renders the CURRENT DSH session (the play's director
- * session) from the client runtime snapshot and sends through the
- * conversation service; the library panels manage characters / world books /
- * presets through the host route.
+ * The chat area renders the ACTIVE play's DSH session (the director
+ * session) directly from its client runtime snapshot, without switching the
+ * global current session, and sends through that session's conversation
+ * service; the library panels manage characters / world books / presets
+ * through the host route.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { ConvViewProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
-import type { ConversationSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ConversationSnapshot, SessionFace } from '@deepseek-ai/dsh-client-runtime/client'
+import type { IConversation } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { PlaySummary, TavernState, TavernStyle } from '../types.ts'
 import { tavernApi, type TavernApi } from './api.ts'
 import type { createTavernStore } from './store.ts'
@@ -20,12 +22,15 @@ import { TauriTavernImportPanel } from './components/TauriTavernImportPanel.tsx'
 import { Empty } from './components/common.tsx'
 import css from './TavernView.module.css'
 
+/** The concrete session methods needed to load a non-current play session. */
+export type OpenableSession = SessionFace & { open(): Promise<void> }
+
 /** Business callbacks injected into the tavern view (session-scoped). */
 export interface TavernViewInjected {
-  /** Open one DSH session (used to switch to a play's director session). */
-  openSession: (sessionId: string) => void
-  /** Send one user turn to the CURRENT session through the conversation service. */
-  send: (text: string) => Promise<void>
+  /** Resolve a play session's live snapshot source without changing the global current session. */
+  getSession: (sessionId: string) => OpenableSession | undefined
+  /** Resolve a play session's conversation service for sending. */
+  getConversation: (sessionId: string) => IConversation
 }
 
 /** Full props: framework runtime share + store share + inject face. */
@@ -90,13 +95,23 @@ async function loadState(api: TavernApi): Promise<TavernState> {
   return api.state()
 }
 
+/** Subscribe to an arbitrary session snapshot without making it the global current session. */
+function useSessionSnapshot(session: OpenableSession | undefined): ConversationSnapshot | undefined {
+  return useSyncExternalStore(
+    useCallback(
+      (onStoreChange: () => void) => session?.subscribe(onStoreChange) ?? (() => {}),
+      [session],
+    ),
+    useCallback(() => session?.getSnapshot(), [session]),
+  )
+}
+
 export function TavernView({
   useStore,
   actions,
-  useSession,
   useSessions,
-  openSession,
-  send,
+  getSession,
+  getConversation,
 }: TavernViewProps) {
   const panel = useStore(s => s.panel)
   const playId = useStore(s => s.playId)
@@ -107,12 +122,14 @@ export function TavernView({
 
   const [state, setState] = useState<TavernState | null>(null)
   const [loading, setLoading] = useState(true)
+  const rootRef = useRef<HTMLDivElement | null>(null)
   // Style preference: optimistic local state, seeded from the server snapshot.
   const [style, setStyle] = useState<TavernStyle>('dsh')
 
   // The current DSH session this view is bound to (session scope).
   const currentSessionId = useSessions(s => s.current)
-  const snapshot = useSession(s => s)
+  // Re-resolve the active play session when the session list changes.
+  const sessionIds = useSessions(s => s.ids)
 
   const refresh = useCallback(async (): Promise<void> => {
     const next = await loadState(tavernApi)
@@ -144,14 +161,14 @@ export function TavernView({
     actions.setPanel('chat')
     const playSummary = state?.plays.find(p => p.id === id)
     if (playSummary !== undefined) {
-      // Ensure the director session exists (resume after restart), then open it.
-      void tavernApi.activatePlay(playSummary.id).then(() => {
-        openSession(playSummary.sessionId)
-      }).catch(e => {
+      // Ensure the director session exists (resume after restart). The view
+      // binds directly to the play session instead of switching the global
+      // current session, so archived tavern sessions stay on the tavern page.
+      void tavernApi.activatePlay(playSummary.id).catch(e => {
         actions.setError(e instanceof Error ? e.message : String(e))
       })
     }
-  }, [actions, openSession, state])
+  }, [actions, state])
 
   const createPlay = useCallback(async (
     title: string,
@@ -166,12 +183,11 @@ export function TavernView({
       await refresh()
       actions.setPlayId(created.id)
       actions.setPanel('chat')
-      openSession(created.sessionId)
     } catch (e) {
       actions.setError(e instanceof Error ? e.message : String(e))
       throw e
     }
-  }, [actions, openSession, refresh])
+  }, [actions, refresh])
 
   const deletePlay = useCallback(async (id: string): Promise<void> => {
     try {
@@ -187,17 +203,95 @@ export function TavernView({
     () => state?.characters.map(c => c.card.data.name) ?? [],
     [state],
   )
-  const messages = useMemo(
-    () => (currentSessionId === undefined ? [] : extractMessages(snapshot, characterNames)),
-    [snapshot, currentSessionId, characterNames],
-  )
-  const running = snapshot.chat.legacy.runningCalls.length > 0
-    || snapshot.queue.length > 0
 
   const activePlay = playId !== null ? state?.plays.find(p => p.id === playId) ?? null : null
+  const activeSession = useMemo(
+    () => activePlay === null ? undefined : getSession(activePlay.sessionId),
+    [activePlay, getSession, sessionIds],
+  )
+  const activeSnapshot = useSessionSnapshot(activeSession)
+  const activeSessionId = activeSession?.sessionId
+  const displaySessionId = activeSessionId ?? currentSessionId
+
+  // Open the selected play session's history in the background. Unlike
+  // `sessions.open`, this does not change the global current session, so an
+  // archived tavern session does not kick the UI back to the workspace home.
+  useEffect(() => {
+    if (activeSession === undefined) return
+    void activeSession.open().catch(e => {
+      actions.setError(e instanceof Error ? e.message : String(e))
+    })
+  }, [activeSession, actions])
+
+  // Hide the host conversation composer while the tavern view is active.
+  // The tavern page provides its own composer, so the DSH bottom input is
+  // redundant. Measure the seat's live height and animate it downward out of
+  // view (height collapse + fade + slight downward shift), so the whole
+  // duration shows motion instead of a clamped wait; restore on unmount so
+  // leaving the tavern tab returns the composer untouched. Use the Web
+  // Animations API directly so it works regardless of CSS :has() support in
+  // the host shell.
+  useLayoutEffect(() => {
+    const root = rootRef.current
+    const scroll = root?.closest('[data-conversation-scroll]')
+    const seat = scroll?.querySelector<HTMLElement>('[data-composer-seat]') ?? document.querySelector<HTMLElement>('[data-composer-seat]')
+    if (seat === null || seat === undefined) return
+    const startHeight = seat.getBoundingClientRect().height
+    if (startHeight <= 0) return
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    const previousStyles = {
+      maxHeight: seat.style.maxHeight,
+      opacity: seat.style.opacity,
+      transform: seat.style.transform,
+      visibility: seat.style.visibility,
+      overflow: seat.style.overflow,
+      pointerEvents: seat.style.pointerEvents,
+    }
+    const restore = (): void => {
+      seat.style.maxHeight = previousStyles.maxHeight
+      seat.style.opacity = previousStyles.opacity
+      seat.style.transform = previousStyles.transform
+      seat.style.visibility = previousStyles.visibility
+      seat.style.overflow = previousStyles.overflow
+      seat.style.pointerEvents = previousStyles.pointerEvents
+    }
+    if (typeof seat.animate !== 'function') {
+      seat.style.maxHeight = '0px'
+      seat.style.opacity = '0'
+      seat.style.transform = 'translateY(8px)'
+      seat.style.visibility = 'hidden'
+      seat.style.overflow = 'hidden'
+      seat.style.pointerEvents = 'none'
+      return restore
+    }
+    seat.style.overflow = 'hidden'
+    seat.style.pointerEvents = 'none'
+    const animation = seat.animate(
+      [
+        { maxHeight: `${startHeight}px`, opacity: '1', transform: 'translateY(0)' },
+        { maxHeight: '0px', opacity: '0', transform: 'translateY(8px)' },
+      ],
+      {
+        duration: reduceMotion ? 0 : 200,
+        easing: 'ease',
+        fill: 'forwards',
+      },
+    )
+    return () => {
+      animation.cancel()
+      restore()
+    }
+  }, [])
+
+  const messages = useMemo(
+    () => (activeSnapshot === undefined ? [] : extractMessages(activeSnapshot, characterNames)),
+    [activeSnapshot, characterNames],
+  )
+  const running = activeSnapshot !== undefined
+    && (activeSnapshot.chat.legacy.runningCalls.length > 0 || activeSnapshot.queue.length > 0)
 
   return (
-    <div className={css.view} data-style={style}>
+    <div ref={rootRef} className={css.view} data-style={style}>
       <div className={css.nav}>
         <span className={css.navTitle}>🏮 酒馆</span>
         {([
@@ -233,7 +327,7 @@ export function TavernView({
         )}
         {!loading && state !== null && (
           <span className={css.hint} style={{ marginRight: 8 }}>
-            会话 {currentSessionId !== undefined ? currentSessionId.slice(0, 12) : '（无）'}
+            会话 {displaySessionId !== undefined ? displaySessionId.slice(0, 12) : '（无）'}
           </span>
         )}
       </div>
@@ -267,7 +361,7 @@ export function TavernView({
               activePlayTitle={activePlay?.title}
               multiAgentAvailable={state.multiAgentAvailable}
               messages={messages}
-              currentSessionId={currentSessionId}
+              activeSessionId={activeSessionId}
               running={running}
               onSelectPlay={selectPlay}
               onGoToCharacters={() => actions.setPanel('characters')}
@@ -277,7 +371,10 @@ export function TavernView({
               onSend={async (text) => {
                 actions.setError(null)
                 try {
-                  await send(text)
+                  if (activePlay === null || activeSession === undefined) {
+                    throw new Error('请先选择一个酒馆会话')
+                  }
+                  await getConversation(activeSession.sessionId).send(text)
                 } catch (e) {
                   actions.setError(e instanceof Error ? e.message : String(e))
                 }

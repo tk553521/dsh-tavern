@@ -38,9 +38,10 @@ export interface ChatPanelProps {
   activePlayTitle: string | undefined
   /** Whether the agent-loop factory is live; multi-agent creation requires it. */
   multiAgentAvailable: boolean
-  /** Messages projected from the current session snapshot (the only display source). */
+  /** Messages projected from the active play session snapshot (the only display source). */
   messages: ViewMessage[]
-  currentSessionId: string | undefined
+  /** Active play's DSH session id once it is available for direct binding. */
+  activeSessionId: string | undefined
   running: boolean
   onSelectPlay: (id: string | null) => void
   onCreatePlay: (
@@ -192,8 +193,7 @@ export function ChatPanel(props: ChatPanelProps) {
     void props.onSend(content)
   }
 
-  const inPlaySession = props.currentSessionId !== undefined
-    && props.plays.some(p => p.sessionId === props.currentSessionId)
+  const inPlaySession = props.activeSessionId !== undefined
 
   return (
     <div className={css.body}>
