@@ -33,6 +33,9 @@ const node: UserConfig = {
   platform: 'node',
   target: 'es2024',
   dts: true,
+  // INVARIANT: only the FIRST config in the exported array may clean `lib`.
+  // Both configs share outDir, so if the client config ever runs first (or
+  // gains `clean: true`), it wipes the other half's freshly written output.
   clean: true,
   // "type": "module" makes ESM emit .js per package.json.
   fixedExtension: false,
@@ -50,6 +53,7 @@ const client: UserConfig = {
   target: 'es2022',
   dts: false,
   sourcemap: true,
+  // See the `clean` note on the node config: this must stay false.
   clean: false,
   external: EXTERNALS,
   define: {

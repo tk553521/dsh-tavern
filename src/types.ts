@@ -255,6 +255,53 @@ export interface Play {
   updatedAt: string
 }
 
+// ── Swipe branches (重试 / 左右切换的多次尝试) ──────────────────────────────
+
+/**
+ * One swipe branch: every alternative generation of the same assistant reply,
+ * forked from a shared balanced session-log prefix. Because DSH session logs
+ * are append-only, regenerating forks a NEW session per variant; the branch
+ * keeps the prefix plus each variant's event tail so any alternative can be
+ * re-materialized as a live session. Event numbers and texts are plain JSON
+ * (`unknown[]`) so swapping variants needs no host-round-trip of typed data.
+ */
+export interface SwipeBranch {
+  /** Play this branch belongs to. */
+  playId: string
+  /**
+   * Stable branch identity: the event count of the fork prefix. One active
+   * lineage has exactly one branch per user turn; edits delete stale ones.
+   */
+  key: string
+  /** Balanced completed-turn prefix shared by every variant. */
+  prefix: unknown[]
+  /** The user message text replayed when a variant is generated. */
+  userText: string
+  /**
+   * One event tail per attempt, from the question turn's `turn/start` through
+   * its `turn/end`. An empty array marks an in-flight generation.
+   */
+  variants: unknown[][]
+  /** Index of the variant currently materialized as the play's session. */
+  current: number
+  /** Whether a generation for `variants[current]` is still running. */
+  busy: boolean
+  /** Generation error of the last attempt, when it failed before settling. */
+  error?: string
+  updatedAt: string
+}
+
+/** Compact per-branch summary for the client (no event payloads). */
+export interface SwipeBranchSummary {
+  playId: string
+  key: string
+  count: number
+  current: number
+  busy: boolean
+  error?: string
+  updatedAt: string
+}
+
 // ── API wire types ─────────────────────────────────────────────────────────
 
 /** Tavern view style: DSH-token look or the legacy dark-gold palette. */
@@ -272,6 +319,8 @@ export interface TavernState {
   style?: TavernStyle
   /** Whether the agent factory (agent-loop) is available for multi-agent plays. */
   multiAgentAvailable: boolean
+  /** Swipe-branch summaries across plays (retry alternatives metadata only). */
+  swipes: SwipeBranchSummary[]
 }
 
 // ── Local TauriTavern data-directory import ───────────────────────────────

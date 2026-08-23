@@ -1,6 +1,10 @@
 # Dependencies
 node_modules/
 
+# Build output. Produced by `pnpm build`; never commit it — it is minified,
+# conflicts on every merge, and grew the repo by ~65% over four commits.
+lib/
+
 # Local reference checkouts
 .ref/
 
