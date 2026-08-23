@@ -11,7 +11,7 @@ import type { ConvViewProps } from '@deepseek-ai/dsh-client-ui-conversation/clie
 import type { PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ConversationSnapshot, SessionFace } from '@deepseek-ai/dsh-client-runtime/client'
 import type { IConversation } from '@deepseek-ai/dsh-client-ui-conversation/client'
-import type { PlaySummary, TavernState, TavernStyle } from '../types.ts'
+import type { PlaySummary, SwipeBranchSummary, TavernState, TavernStyle } from '../types.ts'
 import { tavernApi, type TavernApi } from './api.ts'
 import type { createTavernStore } from './store.ts'
 import { ChatPanel } from './components/ChatPanel.tsx'
@@ -39,12 +39,39 @@ export type TavernViewProps =
   & PropsStore<ReturnType<typeof createTavernStore>>
   & TavernViewInjected
 
+/** Lifecycle status of one projected reply row. */
+export type ViewStatus = 'streaming' | 'done' | 'stopped' | 'truncated' | 'error'
+
 /** One message row projected from the session snapshot for tavern display. */
 export interface ViewMessage {
   id: string
   kind: 'user' | 'assistant'
   name?: string
   text: string
+  /** Model thinking (reasoning) text, rendered as a collapsible block. */
+  thinking?: string
+  /** Generation status of the row (user rows are always 'done'). */
+  status: ViewStatus
+  /** Failure text when status is 'error'. */
+  errorText?: string
+  /** Durable message id: the edit/retry address (absent on streaming rows). */
+  messageId?: string
+  /**
+   * Whole-step text behind `messageId`. A classic-mode step can render as
+   * several speaker rows (and a single row has its `角色名：` prefix stripped),
+   * so the editor must round-trip the stored step text instead of this row's
+   * display text — otherwise saving an edit would drop the other speakers.
+   * Only set on the row that carries `messageId`.
+   */
+  stepText?: string
+}
+
+/** Shape read from `assistant-step` chat nodes (mirrors AssistantChatData). */
+interface ChatAssistantStepData {
+  status?: 'running' | 'settled' | 'interrupted'
+  turn?: number
+  blocks?: readonly { kind: string; text?: string }[]
+  finalNode?: { messageId?: string }
 }
 
 /** Extract text blocks from a content block list. */
@@ -55,35 +82,134 @@ function blocksToText(blocks: readonly { type: string; text?: string }[]): strin
     .join('')
 }
 
-/** Project ordered user/assistant rows from the session snapshot. */
+/** Join one kind of assistant blocks (text / reasoning). */
+function joinBlocks(blocks: readonly { kind: string; text?: string }[], kind: string): string {
+  return blocks
+    .filter(block => block.kind === kind && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('')
+}
+
+/** One contiguous stretch of a reply spoken by the same character. */
+interface SpeakerRun {
+  /** Undefined for narration / an unrecognized prefix (rendered as 叙述者). */
+  name?: string
+  text: string
+}
+
+/** `角色名：台词` line prefix that the classic-mode prompt asks the model for. */
+const SPEAKER_LINE_RE = /^\s*([^：:\n]{1,20})[：:]\s*([\s\S]*)$/
+
+/**
+ * Split a classic-mode reply into consecutive speaker runs.
+ *
+ * In classic (single-agent) mode one assistant step contains the whole cast's
+ * lines, each prefixed with `角色名：` per `buildClassicSystem`. Matching only
+ * the head of the step would file every line under the first speaker, so scan
+ * line by line and start a new run whenever a line opens with a name the play
+ * actually knows. Unknown prefixes (`注意：`, a colon mid-sentence) are not
+ * speakers and keep flowing into the current run, which preserves the previous
+ * behaviour — one nameless row holding the entire reply — for replies that
+ * never name a character.
+ */
+function splitSpeakerRuns(text: string, characterNames: readonly string[]): SpeakerRun[] {
+  const runs: { name?: string; lines: string[] }[] = []
+  for (const line of text.split('\n')) {
+    const match = SPEAKER_LINE_RE.exec(line)
+    const speaker = match !== null && characterNames.includes(match[1]!.trim())
+      ? match[1]!.trim()
+      : undefined
+    if (speaker !== undefined) runs.push({ name: speaker, lines: [match![2]!] })
+    else if (runs.length === 0) runs.push({ lines: [line] })
+    else runs[runs.length - 1]!.lines.push(line)
+  }
+  const out = runs
+    .map(run => ({
+      ...(run.name !== undefined ? { name: run.name } : {}),
+      text: run.lines.join('\n').trim(),
+    }))
+    .filter(run => run.text !== '')
+  // A step that is nothing but bare labels still needs a row to host its
+  // thinking block, status line and retry seat.
+  return out.length > 0 ? out : [{ text: text.trim() }]
+}
+
+/**
+ * Project ordered user/assistant rows from the session snapshot, attaching
+ * per-row generation status (streaming / stopped / truncated / error) and
+ * thinking text from the chat node's turn metadata.
+ */
 export function extractMessages(
   snapshot: ConversationSnapshot,
   characterNames: readonly string[],
 ): ViewMessage[] {
+  // First pass: collect turn-level end markers (max-token truncation / error).
+  const turnMarks = new Map<number, { truncated?: true; error?: string }>()
+  for (const key of snapshot.chat.order) {
+    const node = snapshot.chat.nodes.get(key)
+    if (node === undefined) continue
+    const data = node.data as { turn?: number; message?: string }
+    if (node.kind === 'turn-max-tokens' && typeof data.turn === 'number') {
+      turnMarks.set(data.turn, { ...turnMarks.get(data.turn), truncated: true })
+    } else if (node.kind === 'turn-error' && typeof data.turn === 'number') {
+      const error = typeof data.message === 'string' && data.message !== '' ? data.message : '生成失败'
+      turnMarks.set(data.turn, { ...turnMarks.get(data.turn), error })
+    }
+  }
+
   const out: ViewMessage[] = []
   for (const key of snapshot.chat.order) {
     const node = snapshot.chat.nodes.get(key)
     if (node === undefined) continue
-    const data = node.data as { content?: readonly { type: string; text?: string }[]; blocks?: readonly { kind: string; text?: string }[] }
-    if (node.kind === 'user') {
+    if (node.kind === 'user' || node.kind === 'steering') {
+      const data = node.data as { content?: readonly { type: string; text?: string }[] }
       const text = blocksToText(data.content ?? []).trim()
-      if (text !== '' && text !== '[开场] 扮演开始。') out.push({ id: key, kind: 'user', text })
+      if (text !== '' && text !== '[开场] 扮演开始。') {
+        out.push({ id: key, kind: 'user', text, status: 'done', messageId: node.id })
+      }
     } else if (node.kind === 'assistant-step') {
-      const text = (data.blocks ?? [])
-        .filter((block): block is { kind: 'text'; text: string } => block.kind === 'text' && typeof block.text === 'string')
-        .map(block => block.text)
-        .join('')
-      const trimmed = text.trim()
-      if (trimmed === '') continue
-      const match = /^([^：:]{1,20})[：:]\s*([\s\S]+)$/.exec(trimmed)
-      const name = match !== null && characterNames.includes(match[1]!.trim())
-        ? match[1]!.trim()
-        : undefined
-      out.push({
-        id: key,
-        kind: 'assistant',
-        ...(name !== undefined ? { name } : {}),
-        text: name !== undefined ? match![2]!.trim() : trimmed,
+      const data = node.data as ChatAssistantStepData
+      const blocks = data.blocks ?? []
+      const thinking = joinBlocks(blocks, 'reasoning').trim()
+      const text = joinBlocks(blocks, 'text').trim()
+      if (text === '' && thinking === '') continue
+      let status: ViewStatus = data.status === 'running'
+        ? 'streaming'
+        : data.status === 'interrupted'
+          ? 'stopped'
+          : 'done'
+      let errorText: string | undefined
+      const mark = typeof data.turn === 'number' ? turnMarks.get(data.turn) : undefined
+      if (status === 'done' && mark?.truncated === true) status = 'truncated'
+      if (mark?.error !== undefined) {
+        status = 'error'
+        errorText = mark.error
+      }
+      const runs = splitSpeakerRuns(text, characterNames)
+      runs.forEach((run, index) => {
+        const isTail = index === runs.length - 1
+        out.push({
+          // Suffix every run: the key stays unique across a multi-speaker step
+          // and stable as later runs stream in (row `i` keeps `key#i`).
+          id: `${key}#${index}`,
+          kind: 'assistant',
+          ...(run.name !== undefined ? { name: run.name } : {}),
+          text: run.text,
+          // Reasoning belongs to the step rather than to one speaker: render it
+          // once, above the first line the step produced.
+          ...(thinking !== '' && index === 0 ? { thinking } : {}),
+          // Generation continues at the tail, so only the tail shows the live
+          // status; the runs before it are finished lines.
+          status: isTail ? status : 'done',
+          ...(isTail && errorText !== undefined ? { errorText } : {}),
+          // `messageId` addresses the whole step (edit / retry / swipe), so at
+          // most one row may own it, and it must be the tail: that is where the
+          // retry and swipe seat belongs (`isLastAssistant`), and an edit saved
+          // from any earlier row would rewrite the step to that row alone.
+          ...(isTail && data.finalNode?.messageId !== undefined
+            ? { messageId: data.finalNode.messageId, stepText: text }
+            : {}),
+        })
       })
     }
   }
@@ -223,6 +349,17 @@ export function TavernView({
     })
   }, [activeSession, actions])
 
+  // The tavern view opts into the shell's composer-overlay contract
+  // (`data-conversation-composer-overlay` on the root, the same opt-in the
+  // Trajectory view uses): the resident scrollport then constrains the view
+  // column to the viewport (viewArea flex 1 1 0 / min-height 0 / overflow
+  // hidden), so `.view`'s 100% height chain is definite and only the
+  // tavern's own .messages/.content columns scroll — the tab bar and play
+  // sidebar stay pinned. Hand-pinning the scrollport here instead (inline
+  // overflow hidden) breaks that chain: the view then wraps in
+  // height-auto flow, grows with the transcript, and its own .messages
+  // scroller never overflows, leaving the conversation un-scrollable.
+
   // Hide the host conversation composer while the tavern view is active.
   // The tavern page provides its own composer, so the DSH bottom input is
   // redundant. Measure the seat's live height and animate it downward out of
@@ -287,11 +424,69 @@ export function TavernView({
     () => (activeSnapshot === undefined ? [] : extractMessages(activeSnapshot, characterNames)),
     [activeSnapshot, characterNames],
   )
-  const running = activeSnapshot !== undefined
-    && (activeSnapshot.chat.legacy.runningCalls.length > 0 || activeSnapshot.queue.length > 0)
+  const running = (activeSnapshot?.running ?? false)
+    || (activeSnapshot !== undefined && activeSnapshot.chat.legacy.partial !== null)
+
+  // The latest swipe branch of the active play (its generation progress).
+  const swipe = useMemo<SwipeBranchSummary | undefined>(() => {
+    if (playId === null || state === null) return undefined
+    const branches = state.swipes.filter(branch => branch.playId === playId)
+    if (branches.length === 0) return undefined
+    return branches.reduce((a, b) => (a.updatedAt >= b.updatedAt ? a : b))
+  }, [state, playId])
+  // Serializes swipe/reroll/edit calls so the client and host never fork twice.
+  const [branching, setBranching] = useState(false)
+
+  // A busy swipe branch settles on the host in the background; poll the tavern
+  // state until the branch leaves its in-flight slot so 3/3 生成中 clears and
+  // switch buttons unlock even when the model turn errored.
+  useEffect(() => {
+    if (swipe?.busy !== true) return
+    const timer = setTimeout(() => {
+      void refresh().catch(() => {})
+    }, 800)
+    return () => clearTimeout(timer)
+  }, [swipe?.busy, running, refresh, swipe])
+
+  const runBranchOp = useCallback((op: () => Promise<unknown>): void => {
+    if (branching) return
+    setBranching(true)
+    actions.setError(null)
+    void op()
+      .then(() => refresh())
+      .catch(e => actions.setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setBranching(false))
+  }, [actions, branching, refresh])
+
+  const retryReply = useCallback((): void => {
+    if (activePlay === null) return
+    runBranchOp(() => tavernApi.retryReply(activePlay.id))
+  }, [activePlay, runBranchOp])
+
+  const swipeReply = useCallback((step: 1 | -1): void => {
+    if (activePlay === null || swipe === undefined) return
+    runBranchOp(() => tavernApi.swipeReply(activePlay.id, swipe.key, step))
+  }, [activePlay, swipe, runBranchOp])
+
+  const editAssistant = useCallback((messageId: string, text: string): void => {
+    if (activePlay === null) return
+    runBranchOp(() => tavernApi.editAssistantMessage(activePlay.id, messageId, text))
+  }, [activePlay, runBranchOp])
+
+  const editUserRetry = useCallback((messageId: string, text: string): void => {
+    if (activePlay === null) return
+    runBranchOp(() => tavernApi.editUserMessageAndRetry(activePlay.id, messageId, text))
+  }, [activePlay, runBranchOp])
+
+  const cancelRun = useCallback((): void => {
+    if (activeSession === undefined) return
+    getConversation(activeSession.sessionId).cancel().catch(e => {
+      actions.setError(e instanceof Error ? e.message : String(e))
+    })
+  }, [activeSession, actions, getConversation])
 
   return (
-    <div ref={rootRef} className={css.view} data-style={style}>
+    <div ref={rootRef} className={css.view} data-style={style} data-conversation-composer-overlay="">
       <div className={css.nav}>
         <span className={css.navTitle}>🏮 酒馆</span>
         {([
@@ -363,6 +558,13 @@ export function TavernView({
               messages={messages}
               activeSessionId={activeSessionId}
               running={running}
+              swipe={swipe}
+              branching={branching}
+              onRetry={retryReply}
+              onSwipe={swipeReply}
+              onCancel={cancelRun}
+              onEditAssistant={editAssistant}
+              onEditUserRetry={editUserRetry}
               onSelectPlay={selectPlay}
               onGoToCharacters={() => actions.setPanel('characters')}
               onGoToLorebooks={() => actions.setPanel('lorebooks')}
@@ -377,6 +579,10 @@ export function TavernView({
                   await getConversation(activeSession.sessionId).send(text)
                 } catch (e) {
                   actions.setError(e instanceof Error ? e.message : String(e))
+                  // Surface *and* reject (same contract as onCreatePlay): the
+                  // nav slot shows why, and the composer learns the text never
+                  // left the client so it can hand the draft back.
+                  throw e
                 }
               }}
             />

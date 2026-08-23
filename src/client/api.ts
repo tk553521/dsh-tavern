@@ -4,7 +4,7 @@
  */
 
 import type {
-  CharacterRecord, Play, Preset, TavernState, TavernStyle, TauriTavernImportReport, WorldBookRecord,
+  CharacterRecord, Play, Preset, SwipeBranchSummary, TavernState, TavernStyle, TauriTavernImportReport, WorldBookRecord,
 } from '../types.ts'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -25,7 +25,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(message)
   }
-  return response.json() as Promise<T>
+  // DELETE and simple acks may legitimately answer with an empty body;
+  // parse only when there is content so a void endpoint never throws here.
+  if (response.status === 204) return undefined as T
+  const text = await response.text()
+  if (text === '') return undefined as T
+  return JSON.parse(text) as T
 }
 
 /** Patch values for one preset. `null` clears an optional field. */
@@ -83,6 +88,14 @@ export interface TavernApi {
   activatePlay(id: string): Promise<Play>
   updatePlay(id: string, patch: Partial<Pick<Play, 'title' | 'lorebookIds' | 'presetId' | 'narratorEnabled' | 'multiAgent' | 'characterIds'>>): Promise<Play>
   deletePlay(id: string): Promise<void>
+  /** Regenerate the last assistant reply as a new swipe variant. */
+  retryReply(playId: string): Promise<{ play: Play; branch: SwipeBranchSummary }>
+  /** Materialize another stored variant of one swipe branch (step ±1). */
+  swipeReply(playId: string, key: string, step: 1 | -1): Promise<{ play: Play; branch: SwipeBranchSummary }>
+  /** Edit one assistant reply in place (forks the session, no regeneration). */
+  editAssistantMessage(playId: string, messageId: string, text: string): Promise<{ play: Play }>
+  /** Edit one user message and regenerate the answer from it. */
+  editUserMessageAndRetry(playId: string, messageId: string, text: string): Promise<{ play: Play }>
   setDefaultPreset(id: string | undefined): Promise<void>
   /** Persist the tavern view style preference. */
   setStyle(style: TavernStyle): Promise<void>
@@ -152,6 +165,22 @@ function api(): TavernApi {
     deletePlay: async (id) => {
       await request(`/tavern/plays/${encodeURIComponent(id)}`, { method: 'DELETE' })
     },
+    retryReply: (playId) => request(`/tavern/plays/${encodeURIComponent(playId)}/messages/retry`, {
+      method: 'POST',
+      body: '{}',
+    }),
+    swipeReply: (playId, key, step) => request(`/tavern/plays/${encodeURIComponent(playId)}/messages/swipe`, {
+      method: 'POST',
+      body: JSON.stringify({ key, step }),
+    }),
+    editAssistantMessage: (playId, messageId, text) => request(
+      `/tavern/plays/${encodeURIComponent(playId)}/messages/${encodeURIComponent(messageId)}`,
+      { method: 'PUT', body: JSON.stringify({ text }) },
+    ),
+    editUserMessageAndRetry: (playId, messageId, text) => request(
+      `/tavern/plays/${encodeURIComponent(playId)}/messages/${encodeURIComponent(messageId)}/retry`,
+      { method: 'POST', body: JSON.stringify({ text }) },
+    ),
     setDefaultPreset: async (defaultPresetId) => {
       await request('/tavern/settings', {
         method: 'PUT',

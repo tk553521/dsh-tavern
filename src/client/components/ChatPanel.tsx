@@ -3,8 +3,8 @@
  * snapshot), composer, and play creation. The conversation itself is the
  * DSH session — sending routes through the conversation service.
  */
-import { useEffect, useMemo, useRef, useState } from 'react'
-import type { PlaySummary } from '../../types.ts'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { PlaySummary, SwipeBranchSummary } from '../../types.ts'
 import type { TavernApi } from '../api.ts'
 import { avatarSrc } from '../avatar.ts'
 import type { ViewMessage } from '../TavernView.tsx'
@@ -43,7 +43,21 @@ export interface ChatPanelProps {
   /** Active play's DSH session id once it is available for direct binding. */
   activeSessionId: string | undefined
   running: boolean
+  /** Current swipe branch of the active play (alternative generations). */
+  swipe?: SwipeBranchSummary
+  /** True while a retry/swipe/edit request is in flight. */
+  branching: boolean
   onSelectPlay: (id: string | null) => void
+  /** Regenerate the last assistant reply (stores the current one as a swipe). */
+  onRetry: () => void
+  /** Switch to another stored swipe variant (step ±1, wraps). */
+  onSwipe: (step: 1 | -1) => void
+  /** Abort the in-flight generation. */
+  onCancel: () => void
+  /** Save an edited assistant reply (in place). */
+  onEditAssistant: (messageId: string, text: string) => void
+  /** Save an edited user message and regenerate from it. */
+  onEditUserRetry: (messageId: string, text: string) => void
   onCreatePlay: (
     title: string,
     characterIds: string[],
@@ -82,6 +96,134 @@ function matchesLorebook(book: LorebookChoice, query: string): boolean {
   return [book.name, book.description ?? ''].join('\n').toLowerCase().includes(query)
 }
 
+/** Markup tags allowed in chat bubbles; everything else is dropped or unwrapped. */
+const HTML_ALLOWED_TAGS = new Set([
+  'p', 'br', 'div', 'span', 'blockquote', 'hr',
+  'b', 'strong', 'i', 'em', 'u', 's', 'del', 'font', 'code', 'pre',
+  'a', 'img', 'ul', 'ol', 'li',
+  'h1', 'h2', 'h3', 'h4',
+  'table', 'thead', 'tbody', 'tr', 'td', 'th',
+])
+
+/** Per-tag attribute whitelist; all other attributes (incl. on*) are removed. */
+const HTML_ALLOWED_ATTRS: Record<string, string[]> = {
+  a: ['href', 'title'],
+  img: ['src', 'alt', 'title', 'width', 'height'],
+  font: ['color'],
+  td: ['colspan', 'rowspan'],
+  th: ['colspan', 'rowspan'],
+}
+
+/** Quick tag sniff to distinguish HTML markup from plain narrative text. */
+const HTML_TAG_RE = /<\s*(a|img|div|span|p|br|hr|table|tr|td|th|ul|ol|li|blockquote|code|pre|font|b|i|u|em|strong|s|del|h[1-4])\b[^>]*>/i
+
+/** Hard cap on inline data-URL media in message bubbles (memory bound). */
+const MAX_DATA_IMAGE_BYTES = 512 * 1024
+
+function safeUrl(value: string, allowDataImage: boolean): string | null {
+  const trimmed = value.trim()
+  if (/^(https?:|mailto:)/i.test(trimmed)) return trimmed
+  if (allowDataImage) {
+    // Bitmap data URLs only: `data:image/svg+xml` (and its Base64 form) is
+    // rejected so a crafted message cannot smuggle an SVG script payload or
+    // an arbitrarily large inline resource into the bubble.
+    const match = /^data:image\/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+/=]+)$/i.exec(trimmed)
+    if (match !== null && match[2]!.length <= Math.ceil(MAX_DATA_IMAGE_BYTES * 4 / 3) + 4) {
+      return trimmed
+    }
+  }
+  return null
+}
+
+/**
+ * Elements dropped with their subtree instead of being unwrapped.
+ *
+ * Beyond the obviously active ones (script/style/iframe/…), this covers every
+ * element whose children the HTML parser treats as raw text or as an inert
+ * sub-document. Those parse differently in the DOMParser document used here
+ * (scripting disabled, no template contents in the main tree) than in the live
+ * document the fragment is later injected into, which is the classic mXSS
+ * lever: unwrapping `<noscript>` hands back markup that never went through the
+ * whitelist. Nothing in a roleplay bubble legitimately needs them.
+ */
+const STRIP_CONTENT = new Set([
+  'script', 'style', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'select', 'textarea',
+  'noscript', 'template', 'noembed', 'noframes', 'xmp', 'plaintext', 'title',
+])
+
+/** One whitelist pass over `html`; returns the serialized sanitized body. */
+function sanitizePass(html: string): string {
+  const doc = new DOMParser().parseFromString(html, 'text/html')
+  const sanitizeNode = (node: Node): void => {
+    for (const child of Array.from(node.childNodes)) {
+      if (child.nodeType === 1) {
+        const el = child as HTMLElement
+        const tag = el.tagName.toLowerCase()
+        if (STRIP_CONTENT.has(tag)) {
+          el.remove()
+          continue
+        }
+        if (!HTML_ALLOWED_TAGS.has(tag)) {
+          // Unwrap unknown tags but keep their (sanitized) children.
+          sanitizeNode(el)
+          while (el.firstChild !== null) el.parentNode!.insertBefore(el.firstChild, el)
+          el.remove()
+          continue
+        }
+        for (const attr of Array.from(el.attributes)) {
+          const allowed = HTML_ALLOWED_ATTRS[tag] ?? []
+          if (!allowed.includes(attr.name.toLowerCase())) {
+            el.removeAttribute(attr.name)
+            continue
+          }
+          if (tag === 'a' && attr.name === 'href') {
+            const url = safeUrl(attr.value, false)
+            if (url === null) el.removeAttribute('href')
+            else el.setAttribute('href', url)
+          }
+          if (tag === 'img' && attr.name === 'src') {
+            const url = safeUrl(attr.value, true)
+            if (url === null) el.removeAttribute('src')
+            else el.setAttribute('src', url)
+          }
+        }
+        if (tag === 'a') {
+          el.setAttribute('target', '_blank')
+          el.setAttribute('rel', 'noopener noreferrer')
+        }
+        sanitizeNode(el)
+      }
+    }
+  }
+  sanitizeNode(doc.body)
+  return doc.body.innerHTML
+}
+
+/**
+ * Sanitize roleplay HTML into a whitelist-only fragment safe for innerHTML.
+ * Returns null when the result cannot be trusted; callers must then render the
+ * message as plain text.
+ *
+ * Message text is model output steered by imported character cards, i.e.
+ * attacker-controllable, and there is no DOMPurify here to lean on. So the
+ * whitelist pass is followed by a fixed-point check: feeding the serialized
+ * output back through the parser must be a no-op. Any mutation means the
+ * browser reads the sanitized string differently from the tree that was
+ * sanitized (namespace confusion, raw-text re-interpretation, entity
+ * round-tripping) — the general shape of every mXSS bypass — and the safe
+ * answer is to publish nothing rather than guess which reading wins.
+ */
+export function sanitizeMessageHtml(html: string): string | null {
+  const first = sanitizePass(html)
+  const second = sanitizePass(first)
+  return second === first ? first : null
+}
+
+/** Whether the message contains HTML markup worth rendering as markup. */
+export function looksLikeHtml(text: string): boolean {
+  return HTML_TAG_RE.test(text)
+}
+
 export function ChatPanel(props: ChatPanelProps) {
   const { running } = props
   const [draft, setDraft] = useState('')
@@ -94,12 +236,30 @@ export function ChatPanel(props: ChatPanelProps) {
   const [narratorEnabled, setNarratorEnabled] = useState(false)
   const [multiAgent, setMultiAgent] = useState(true)
   const [creating, setCreating] = useState(false)
-  const bottomRef = useRef<HTMLDivElement | null>(null)
+  const listRef = useRef<HTMLDivElement | null>(null)
 
-  // Scroll to bottom when the message list grows.
+  // Scroll-follow contract: the list pins to the bottom only while the user
+  // is already reading the tail. Scrolling up while streaming un-pins it, so
+  // reading older messages is never yanked back down; a newly appended
+  // message (send/reply) or a play switch always snaps to the end. Scroll
+  // only this column; never the shell scrollport (tab bar/sidebar stay put).
+  const pinnedRef = useRef(true)
+  const lastRef = useRef<{ playKey: string | null; count: number }>({ playKey: null, count: 0 })
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ block: 'end' })
-  }, [props.messages.length])
+    const list = listRef.current
+    if (list === null) return
+    const prev = lastRef.current
+    const newPlay = prev.playKey !== props.activePlayId
+    const appended = props.messages.length > prev.count
+    lastRef.current = { playKey: props.activePlayId, count: props.messages.length }
+    // A new message only forces the pin when the user just sent it (the last
+    // row is the user's own); assistant/observer rows respect the pin state.
+    const last = props.messages[props.messages.length - 1]
+    const ownSend = appended && last?.kind === 'user'
+    if (newPlay || ownSend || pinnedRef.current) {
+      list.scrollTop = list.scrollHeight
+    }
+  }, [props.messages, running, props.activePlayId])
 
   const selectedCharacters = selectedIds
     .map(id => props.characters.find(character => character.id === id))
@@ -181,6 +341,9 @@ export function ChatPanel(props: ChatPanelProps) {
       setLorebookIds([])
       setLorebookQuery('')
       setPresetId(undefined)
+    } catch {
+      // The error is already surfaced through the nav error slot; swallow
+      // here so the fire-and-forget click path never rejects unhandled.
     } finally {
       setCreating(false)
     }
@@ -189,9 +352,35 @@ export function ChatPanel(props: ChatPanelProps) {
   const send = (): void => {
     const content = draft.trim()
     if (content === '' || running) return
+    // Clear optimistically so the composer feels instant, but a rejected send
+    // means the text never reached the session: hand it back instead of
+    // destroying it. Only refill an untouched composer — the user may have
+    // started typing the next line while the failing send was in flight, and
+    // that draft outranks the one we are returning.
     setDraft('')
-    void props.onSend(content)
+    void props.onSend(content).catch(() => {
+      setDraft(prev => (prev === '' ? content : prev))
+    })
   }
+
+  // Resolve the retry/swipe seat once per transcript instead of re-scanning the
+  // tail from inside the row map: that scan was O(n²) and reran on every
+  // streamed token. Equivalent to the old per-row predicate — the seat is the
+  // row with no assistant row after it, and only once it has settled.
+  const lastAssistantIndex = useMemo(() => {
+    for (let index = props.messages.length - 1; index >= 0; index -= 1) {
+      if (props.messages[index]!.kind === 'assistant') return index
+    }
+    return -1
+  }, [props.messages])
+
+  // MessageRow is memoized, so every callback it receives has to survive a
+  // re-render identical or the memo never hits. Rows hand their own address up
+  // instead of each one closing over its message.
+  const saveEdit = useCallback((messageId: string, kind: ViewMessage['kind'], text: string): void => {
+    if (kind === 'user') props.onEditUserRetry(messageId, text)
+    else props.onEditAssistant(messageId, text)
+  }, [props.onEditUserRetry, props.onEditAssistant])
 
   const inPlaySession = props.activeSessionId !== undefined
 
@@ -541,19 +730,31 @@ export function ChatPanel(props: ChatPanelProps) {
                 删除
               </Button>
             </div>
-            <div className={css.messages}>
+            <div
+              className={css.messages}
+              ref={listRef}
+              onScroll={event => {
+                const el = event.currentTarget
+                pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+              }}
+            >
               {props.messages.length === 0 && (
                 <Empty text="对话尚未开始。发送第一句话开始这场扮演。" />
               )}
-              {props.messages.map(message => (
-                <MessageRow key={message.id} message={message} />
+              {props.messages.map((message, index) => (
+                <MessageRow
+                  key={message.id}
+                  message={message}
+                  isLastAssistant={index === lastAssistantIndex && message.status !== 'streaming'}
+                  busy={props.branching}
+                  running={running}
+                  swipe={props.swipe}
+                  onRetry={props.onRetry}
+                  onSwipe={props.onSwipe}
+                  onSaveEdit={saveEdit}
+                />
               ))}
-              {running && (
-                <div className={css.msg}>
-                  <span className={css.msgName}><Spinner /> 角色正在酝酿台词…</span>
-                </div>
-              )}
-              <div ref={bottomRef} />
+              <div aria-hidden="true" />
             </div>
             <div className={css.composer}>
               <div className={css.composerRow}>
@@ -570,14 +771,25 @@ export function ChatPanel(props: ChatPanelProps) {
                     }
                   }}
                 />
-                <button
-                  type="button"
-                  className={css.sendBtn}
-                  disabled={running || draft.trim() === '' || !inPlaySession}
-                  onClick={send}
-                >
-                  {running ? '…' : '发送'}
-                </button>
+                {running ? (
+                  <button
+                    type="button"
+                    className={`${css.sendBtn} ${css.stopBtn}`}
+                    onClick={() => props.onCancel()}
+                    title="停止当前输出"
+                  >
+                    停止
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className={css.sendBtn}
+                    disabled={props.branching || draft.trim() === '' || !inPlaySession}
+                    onClick={send}
+                  >
+                    发送
+                  </button>
+                )}
               </div>
               <div className={css.modeRow}>
                 <span>聊天通过 DSH 会话进行：回复会记录在会话日志（轨迹）中；酒馆会话只显示在本页，不会出现在「对话」页。</span>
@@ -590,19 +802,216 @@ export function ChatPanel(props: ChatPanelProps) {
   )
 }
 
-function MessageRow(props: { message: ViewMessage }) {
+/** Collapsible reasoning (思维链) block for one reply. */
+function ThinkingBlock(props: { text: string; streaming: boolean }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className={`${css.thinking} ${open ? css.thinkingOpen : ''}`}>
+      <button
+        type="button"
+        className={css.thinkingToggle}
+        onClick={() => setOpen(prev => !prev)}
+        aria-expanded={open}
+      >
+        <span className={css.thinkingCaret}>{open ? '▾' : '▸'}</span>
+        {props.streaming ? '思维链 · 思考中…' : '思维链'}
+      </button>
+      {open && <div className={css.thinkingBody}>{props.text}</div>}
+    </div>
+  )
+}
+
+/** Status label of one reply row (streaming / stopped / truncated / error). */
+function StatusLine(props: { message: ViewMessage }) {
   const { message } = props
+  if (message.kind !== 'assistant') return null
+  if (message.status === 'streaming') {
+    return <span className={css.msgStatusStreaming}><Spinner /> 正在输出…</span>
+  }
+  if (message.status === 'stopped') {
+    return <span className={`${css.msgStatus} ${css.msgStatusWarn}`}>⏸ 已停止</span>
+  }
+  if (message.status === 'truncated') {
+    return <span className={`${css.msgStatus} ${css.msgStatusWarn}`}>⚠ 已达长度上限，输出被截断</span>
+  }
+  if (message.status === 'error') {
+    return (
+      <span className={`${css.msgStatus} ${css.msgStatusError}`} title={message.errorText}>
+        ✕ 生成出错：{message.errorText ?? '未知错误'}
+      </span>
+    )
+  }
+  return null
+}
+
+interface MessageRowProps {
+  message: ViewMessage
+  /** Whether this row is the final settled assistant reply (retry/swipe seat). */
+  isLastAssistant: boolean
+  busy: boolean
+  running: boolean
+  swipe?: SwipeBranchSummary
+  onRetry: () => void
+  onSwipe: (step: 1 | -1) => void
+  /** Save an edit; the row reports its own address so the parent needs no closure. */
+  onSaveEdit: (messageId: string, kind: ViewMessage['kind'], text: string) => void
+}
+
+/**
+ * Rows are re-projected from the session snapshot on every streamed token, so
+ * `message` is a fresh object each time even when the row it describes did not
+ * change. Compare it field-wise: without this the memo would never hit during
+ * streaming and the whole transcript would re-render per token.
+ */
+function sameMessageRow(prev: MessageRowProps, next: MessageRowProps): boolean {
+  const a = prev.message
+  const b = next.message
+  return prev.isLastAssistant === next.isLastAssistant
+    && prev.busy === next.busy
+    && prev.running === next.running
+    && prev.swipe === next.swipe
+    && prev.onRetry === next.onRetry
+    && prev.onSwipe === next.onSwipe
+    && prev.onSaveEdit === next.onSaveEdit
+    && a.id === b.id
+    && a.kind === b.kind
+    && a.name === b.name
+    && a.text === b.text
+    && a.thinking === b.thinking
+    && a.status === b.status
+    && a.errorText === b.errorText
+    && a.messageId === b.messageId
+    && a.stepText === b.stepText
+}
+
+const MessageRow = memo(function MessageRow(props: MessageRowProps) {
+  const { message } = props
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
   const cls = message.kind === 'user'
     ? `${css.msg} ${css.msgUser}`
     : message.name === undefined
       ? `${css.msg} ${css.msgNarrator}`
       : css.msg
+  const canEdit = message.messageId !== undefined && !props.running && !props.busy
+  const showSwipe = props.isLastAssistant && props.swipe !== undefined && props.swipe.count > 1
+  const showRetry = props.isLastAssistant && !props.running
+  const streaming = message.status === 'streaming'
+  // Rich rendering is per message and conditional twice over: the text has to
+  // look like markup, and the sanitizer has to vouch for its own output (null
+  // = could not, so show the source verbatim). Memoized because sanitizing is
+  // a double DOM parse and the row also re-renders while its editor is open.
+  const richHtml = useMemo(
+    () => (looksLikeHtml(message.text) ? sanitizeMessageHtml(message.text) : null),
+    [message.text],
+  )
+
+  const startEdit = (): void => {
+    // Edits address the whole assistant step, so seed from the step text when
+    // the row is only one speaker's slice of it.
+    setDraft(message.stepText ?? message.text)
+    setEditing(true)
+  }
+
   return (
     <div className={cls}>
       <span className={css.msgName}>
         {message.kind === 'user' ? '你' : message.name ?? '叙述者'}
+        {streaming && <Spinner />}
       </span>
-      <div className={css.msgBubble}>{message.text}</div>
+      {message.thinking !== undefined && (
+        <ThinkingBlock text={message.thinking} streaming={streaming} />
+      )}
+      {message.text !== '' && (editing ? (
+        <div className={css.editArea}>
+          <textarea
+            className={css.editInput}
+            value={draft}
+            rows={Math.min(12, draft.split('\n').length + 1)}
+            disabled={props.busy}
+            onChange={event => setDraft(event.target.value)}
+          />
+          <div className={css.msgActions}>
+            <Button
+              variant="primary"
+              disabled={props.busy || draft.trim() === ''}
+              onClick={() => {
+                if (message.messageId !== undefined) {
+                  props.onSaveEdit(message.messageId, message.kind, draft.trim())
+                }
+                setEditing(false)
+              }}
+            >
+              {message.kind === 'user' ? '保存并重新生成' : '保存'}
+            </Button>
+            <Button variant="ghost" disabled={props.busy} onClick={() => setEditing(false)}>取消</Button>
+          </div>
+        </div>
+      ) : richHtml !== null ? (
+        <div
+          className={`${css.msgBubble} ${css.msgRich}`}
+          dangerouslySetInnerHTML={{ __html: richHtml }}
+        />
+      ) : (
+        <div className={css.msgBubble}>{message.text}</div>
+      ))}
+      <StatusLine message={message} />
+      {!editing && (showRetry || canEdit) && (
+        <div className={css.msgActions}>
+          {showSwipe && (
+            <span className={css.swipeNav}>
+              <button
+                type="button"
+                className={css.swipeBtn}
+                disabled={props.busy || props.swipe!.busy}
+                onClick={() => props.onSwipe(-1)}
+                title="上一条回复"
+              >
+                ‹
+              </button>
+              <span className={css.swipeCount}>
+                {props.swipe!.current + 1}/{props.swipe!.count}
+                {props.swipe!.busy ? ' ·生成中' : ''}
+              </span>
+              <button
+                type="button"
+                className={css.swipeBtn}
+                disabled={props.busy || props.swipe!.busy}
+                onClick={() => props.onSwipe(1)}
+                title="下一条回复"
+              >
+                ›
+              </button>
+            </span>
+          )}
+          {showRetry && (
+            <button
+              type="button"
+              className={css.msgActionBtn}
+              disabled={props.busy || props.swipe?.busy === true}
+              onClick={() => props.onRetry()}
+              title="重新生成这条回复（旧回复保留在左右切换中）"
+            >
+              ↻ 重试
+            </button>
+          )}
+          {canEdit && (
+            <button
+              type="button"
+              className={css.msgActionBtn}
+              onClick={startEdit}
+              title={message.kind === 'user' ? '修改这条消息并重新生成' : '直接修改这条回复'}
+            >
+              ✎ 编辑
+            </button>
+          )}
+          {props.swipe?.error !== undefined && props.isLastAssistant && (
+            <span className={`${css.msgStatus} ${css.msgStatusError}`} title={props.swipe.error}>
+              ✕ 上次重试失败
+            </span>
+          )}
+        </div>
+      )}
     </div>
   )
-}
+}, sameMessageRow)

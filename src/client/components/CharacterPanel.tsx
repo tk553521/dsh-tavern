@@ -56,9 +56,13 @@ export function CharacterPanel(props: CharacterPanelProps) {
   const deleteSelected = async (): Promise<void> => {
     if (selected === null) return
     if (!confirmAction(`删除角色「${selected.card.data.name}」？相关会话将保留历史但不再指派。`)) return
-    await props.api.deleteCharacter(selected.id)
-    props.onSelect(null)
-    await props.onChanged()
+    try {
+      await props.api.deleteCharacter(selected.id)
+      props.onSelect(null)
+      await props.onChanged()
+    } catch (error) {
+      props.onError(error instanceof Error ? error.message : String(error))
+    }
   }
 
   return (

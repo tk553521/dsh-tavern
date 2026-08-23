@@ -54,6 +54,16 @@
   font: var(--dsw-font-s-14);
 }
 
+/* The tavern view roots itself in the shell's composer-overlay contract
+   (data-conversation-composer-overlay): under it the scrollport pins the
+   view column to the viewport height, so only the tavern's own
+   `.messages` / `.content` columns scroll and the top tab bar plus play
+   sidebar never move while reading long text. */
+:global([data-conversation-scroll]) .view {
+  height: 100%;
+  overflow: hidden;
+}
+
 /* ── top nav ── */
 .nav {
   display: flex;
@@ -366,6 +376,79 @@
   white-space: pre-wrap;
   word-break: break-word;
   font: var(--dsw-font-base-16);
+}
+
+/* Rich-text bubble: message text rendered as sanitized HTML. Keeps the
+   pre-wrap baseline so bare newlines in mixed text still break, and bounds
+   media to the bubble width. */
+.msgRich {
+  line-height: 1.65;
+}
+
+.msgRich p {
+  margin: 0 0 0.6em;
+}
+
+.msgRich p:last-child {
+  margin-bottom: 0;
+}
+
+.msgRich img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  display: block;
+  margin: 4px 0;
+}
+
+.msgRich a {
+  color: var(--tv-accent-text);
+  text-decoration: underline;
+}
+
+.msgRich pre {
+  background: var(--tv-surface-input);
+  border: 1px solid var(--tv-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
+
+.msgRich code {
+  font-family: var(--dsw-font-family-monospace, monospace);
+  font-size: 0.92em;
+}
+
+.msgRich blockquote {
+  margin: 4px 0;
+  padding: 2px 10px;
+  border-left: 3px solid var(--tv-accent-border-strong);
+  color: var(--tv-text-secondary);
+}
+
+.msgRich ul,
+.msgRich ol {
+  margin: 4px 0;
+  padding-left: 22px;
+}
+
+.msgRich table {
+  border-collapse: collapse;
+  margin: 6px 0;
+  font: var(--dsw-font-xs-13);
+}
+
+.msgRich th,
+.msgRich td {
+  border: 1px solid var(--tv-border);
+  padding: 4px 8px;
+}
+
+.msgRich hr {
+  border: none;
+  border-top: 1px solid var(--tv-border);
+  margin: 10px 0;
 }
 
 .msgUser .msgBubble {
@@ -1455,4 +1538,180 @@
     flex-direction: column;
     align-items: flex-start;
   }
+}
+
+/* ── reply lifecycle: thinking chain, status lines, actions, swipes ── */
+
+/* Collapsible reasoning block above a reply bubble. */
+.thinking {
+  border: 1px dashed var(--tv-border);
+  border-radius: 10px;
+  background: var(--tv-surface-card);
+  overflow: hidden;
+}
+
+.thinkingToggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 10px;
+  border: none;
+  background: transparent;
+  color: var(--tv-text-tertiary);
+  font: var(--dsw-font-xxs-12);
+  cursor: pointer;
+  text-align: left;
+}
+
+.thinkingToggle:hover {
+  color: var(--tv-text-secondary);
+}
+
+.thinkingCaret {
+  color: var(--tv-accent-text);
+}
+
+.thinkingBody {
+  padding: 2px 10px 8px;
+  color: var(--tv-text-secondary);
+  font: var(--dsw-font-xs-13);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+/* Per-row generation status line. */
+.msgStatus {
+  font: var(--dsw-font-xxs-12);
+  color: var(--tv-text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.msgStatusWarn {
+  color: var(--dsw-alias-warning-text, #b45309);
+}
+
+.msgStatusError {
+  color: var(--dsw-alias-danger-text, #c43d3d);
+  max-width: 100%;
+}
+
+.msgStatusStreaming {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: var(--dsw-font-xxs-12);
+  color: var(--tv-accent-text);
+}
+
+/* Message action toolbar (edit / retry / swipe switch). */
+.msgActions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.msgUser .msgActions {
+  justify-content: flex-end;
+}
+
+.msgActionBtn {
+  border: 1px solid var(--tv-border);
+  background: transparent;
+  color: var(--tv-text-tertiary);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font: var(--dsw-font-xxs-12);
+  cursor: pointer;
+  transition: color var(--ds-transition-duration) var(--ds-ease-in-out),
+    border-color var(--ds-transition-duration) var(--ds-ease-in-out);
+}
+
+.msgActionBtn:hover:not(:disabled) {
+  color: var(--tv-accent-text);
+  border-color: var(--tv-accent-border);
+}
+
+.msgActionBtn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.swipeNav {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid var(--tv-border);
+  border-radius: 999px;
+  padding: 0 4px;
+}
+
+.swipeBtn {
+  border: none;
+  background: transparent;
+  color: var(--tv-text-secondary);
+  font: var(--dsw-font-s-14);
+  width: 22px;
+  height: 22px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 999px;
+}
+
+.swipeBtn:hover:not(:disabled) {
+  color: var(--tv-accent-text);
+  background: var(--tv-accent-soft);
+}
+
+.swipeBtn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.swipeCount {
+  font: var(--dsw-font-xxxs-11);
+  color: var(--tv-text-tertiary);
+  min-width: 34px;
+  text-align: center;
+  user-select: none;
+}
+
+/* Inline message editor. */
+.editArea {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: min(420px, 100%);
+}
+
+.editInput {
+  resize: vertical;
+  background: var(--tv-surface-input);
+  border: 1px solid var(--tv-border);
+  border-radius: 10px;
+  color: var(--tv-text);
+  padding: 9px 12px;
+  font: var(--dsw-font-s-14);
+  font-family: inherit;
+  outline: none;
+}
+
+.editInput:focus {
+  border-color: var(--tv-focus);
+}
+
+/* Composer stop button (replaces send while generating). */
+.stopBtn {
+  background: transparent;
+  border: 1px solid var(--dsw-alias-danger-text, #c43d3d);
+  color: var(--dsw-alias-danger-text, #c43d3d);
+}
+
+.stopBtn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--dsw-alias-danger-text, #c43d3d) 12%, transparent);
 }

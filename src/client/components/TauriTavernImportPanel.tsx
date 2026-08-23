@@ -12,11 +12,14 @@ import { Button, Checkbox, Empty, Field, TextInput } from './common.tsx'
 export interface TauriTavernImportPanelProps {
   api: TavernApi
   onChanged: () => Promise<void>
-  onError: (message: string) => void
+  /** `null` clears the nav error slot, so the type must admit it. */
+  onError: (message: string | null) => void
 }
 
 export function TauriTavernImportPanel(props: TauriTavernImportPanelProps) {
-  const [path, setPath] = useState('E:\\TauriTavern')
+  // No default: the data directory is per-machine, and a stale prefilled path
+  // reads as "already configured". The example lives in the placeholder.
+  const [path, setPath] = useState('')
   const [characters, setCharacters] = useState(true)
   const [lorebooks, setLorebooks] = useState(true)
   const [presets, setPresets] = useState(true)
@@ -36,7 +39,7 @@ export function TauriTavernImportPanel(props: TauriTavernImportPanelProps) {
       })
       setReport(result)
       await props.onChanged()
-      props.onError(null as unknown as string)
+      props.onError(null)
     } catch (error) {
       props.onError(error instanceof Error ? error.message : String(error))
     } finally {

@@ -35,9 +35,13 @@ export function LorebookPanel(props: LorebookPanelProps) {
   const deleteSelected = async (): Promise<void> => {
     if (selected === null) return
     if (!confirmAction(`删除世界书「${selected.name}」？使用它的会话将停止注入。`)) return
-    await props.api.deleteLorebook(selected.id)
-    props.onSelect(null)
-    await props.onChanged()
+    try {
+      await props.api.deleteLorebook(selected.id)
+      props.onSelect(null)
+      await props.onChanged()
+    } catch (error) {
+      props.onError(error instanceof Error ? error.message : String(error))
+    }
   }
 
   return (

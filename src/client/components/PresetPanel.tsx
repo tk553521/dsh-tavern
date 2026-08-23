@@ -37,9 +37,13 @@ export function PresetPanel(props: PresetPanelProps) {
   const deleteSelected = async (): Promise<void> => {
     if (selected === null) return
     if (!confirmAction(`删除预设「${selected.name}」？`)) return
-    await props.api.deletePreset(selected.id)
-    props.onSelect(null)
-    await props.onChanged()
+    try {
+      await props.api.deletePreset(selected.id)
+      props.onSelect(null)
+      await props.onChanged()
+    } catch (error) {
+      props.onError(error instanceof Error ? error.message : String(error))
+    }
   }
 
   return (
