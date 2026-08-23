@@ -6,19 +6,25 @@
     "moduleResolution": "Bundler",
     "allowImportingTsExtensions": true,
     "strict": true,
-    "noImplicitAny": true,
     "noUncheckedIndexedAccess": true,
     "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
     "verbatimModuleSyntax": true,
     "jsx": "react-jsx",
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["node"],
+    /* Browser half: no Node globals. `types: ["node"]` here let client code
+       reference `process`/`Buffer` without a warning and mis-inferred
+       `setTimeout` as `NodeJS.Timeout`. */
+    "types": [],
     "isolatedModules": true,
     "forceConsistentCasingInFileNames": true,
     "paths": {
-      "@deepseek-ai/*": [
-        "C:/Users/lthwc/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/*"
+      /* Not shipped inside the globally installed @deepseek-ai/dsh tree;
+         type-only import, resolved against the reference checkout. */
+      "@deepseek-ai/dsh-client-ui-slots": [
+        "./.ref/dsh/packages/client/ui-slots/src/index.ts"
       ]
     }
   },

@@ -8,9 +8,12 @@
     "moduleResolution": "Bundler",
     "allowImportingTsExtensions": true,
     "strict": true,
-    "noImplicitAny": true,
     "noUncheckedIndexedAccess": true,
     "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
     "noEmit": true,
@@ -18,24 +21,15 @@
       "node"
     ],
     "isolatedModules": true,
-    "forceConsistentCasingInFileNames": true,
-    "paths": {
-      "@deepseek-ai/*": [
-        "C:/Users/lthwc/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/*"
-      ]
-    }
+    "forceConsistentCasingInFileNames": true
   },
+  /* Whole host half, rather than a hand-maintained file list: a new module
+     that no listed root happened to import was silently never typechecked. */
   "include": [
-    "src/index.ts",
-    "src/api.ts",
-    "src/play.ts",
-    "src/storage.ts",
-    "src/types.ts",
-    "src/png.ts",
-    "src/cardcodec.ts",
-    "src/lorebook.ts",
-    "src/prompt.ts",
-    "src/tauritavern.ts",
-    "src/tavern-preset.ts"
+    "src"
+  ],
+  "exclude": [
+    "src/client",
+    "src/css-modules.d.ts"
   ]
 }

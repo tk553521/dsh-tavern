@@ -7,12 +7,14 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { LoggerService } from '@deepseek-ai/cordis'
-import type { CharacterRecord, Play, Preset, WorldBookRecord } from './types.ts'
+import type { CharacterRecord, Play, Preset, SwipeBranchSummary, WorldBookRecord } from './types.ts'
 import { TavernStorage, newId, nowIso } from './storage.ts'
 import { normalizeCard, parseCardInput, avatarDataUrl, normalizeWorldBook, serializeWorldBookFile, importPreset, serializePreset } from './cardcodec.ts'
-import { encodePngCard } from './png.ts'
+import { encodePngCardResult } from './png.ts'
 import { playLorebookIds, TavernSessionRuntime } from './play.ts'
 import { importTauriTavernData } from './tauritavern.ts'
+import { TavernUserError } from './errors.ts'
+import type { TavernConfig } from './config.ts'
 import type { AvatarStore } from './avatarstore.ts'
 
 export interface TavernApiDeps {
@@ -20,6 +22,8 @@ export interface TavernApiDeps {
   runtime: TavernSessionRuntime
   avatars: AvatarStore
   logger: LoggerService
+  /** Plugin config; supplies the extra Host allowlist. */
+  config: TavernConfig
   /** Whether the agent-loop factory is currently available (session assembly). */
   multiAgentAvailable: () => boolean
 }
@@ -76,6 +80,33 @@ function segments(pathname: string): string[] {
   return pathname.split('/').filter(segment => segment !== '')
 }
 
+/**
+ * Whether a `Host` header may drive a mutating request.
+ *
+ * Comparing `Origin` against `Host` alone does not stop DNS rebinding: the
+ * attacker points `evil.example` at 127.0.0.1, and the browser then sends
+ * `Origin: http://evil.example` with `Host: evil.example` — a perfect match,
+ * from a page the attacker controls. An IP literal cannot be rebound this way
+ * (the browser sends the literal the user actually typed), and neither can
+ * `localhost`, so those are the safe set. A deployment reached through a real
+ * hostname opts that name in through the plugin config's `allowedHosts`.
+ * @param hostHeader - the request's Host header.
+ * @param allowed - extra host names from the plugin config, already lowercased.
+ */
+function hostAllowsMutation(hostHeader: string | undefined, allowed: readonly string[]): boolean {
+  if (hostHeader === undefined || hostHeader === '') return false
+  const value = hostHeader.toLowerCase()
+  // Strip the port, taking care with bracketed IPv6 literals.
+  const host = value.startsWith('[')
+    ? value.slice(1, value.indexOf(']') === -1 ? undefined : value.indexOf(']'))
+    : value.replace(/:\d+$/, '')
+  if (host === 'localhost' || host.endsWith('.localhost')) return true
+  // IPv4 / IPv6 literals.
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return true
+  if (host.includes(':')) return true
+  return allowed.includes(host)
+}
+
 export interface PlayCreateInput {
   title?: string
   characterIds: string[]
@@ -87,6 +118,19 @@ export interface PlayCreateInput {
   narratorEnabled?: boolean
   multiAgent?: boolean
   greetingIndex?: number
+}
+
+/** Strip a stored swipe branch down to its client-facing summary. */
+function toSwipeSummary(branch: import('./types.ts').SwipeBranch): SwipeBranchSummary {
+  return {
+    playId: branch.playId,
+    key: branch.key,
+    count: branch.variants.length,
+    current: branch.current,
+    busy: branch.busy,
+    updatedAt: branch.updatedAt,
+    ...(branch.error !== undefined ? { error: branch.error } : {}),
+  }
 }
 
 const PRESET_NUMBER_KEYS = [
@@ -135,6 +179,42 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
   const method = req.method ?? 'GET'
 
   try {
+    // Mutating endpoints are same-origin only. A cross-site page could
+    // otherwise drive the local server with CORS-simple requests (e.g.
+    // text/plain POST via no-cors): the response stays unread, but the
+    // side effect (import arbitrary local paths, delete records, spawn
+    // agents) would already have happened.
+    const mutating = method !== 'GET' && method !== 'HEAD'
+    if (mutating) {
+      if (!hostAllowsMutation(req.headers.host, deps.config.allowedHosts)) {
+        return sendError(
+          res,
+          403,
+          '拒绝来自该主机名的写请求（DNS rebinding 防护）。如确需通过该域名访问，请在插件配置的 allowedHosts 中加入它',
+        )
+      }
+      const origin = req.headers.origin
+      if (origin !== undefined) {
+        let originHost: string | undefined
+        try { originHost = new URL(origin).host } catch { originHost = undefined }
+        if (originHost === undefined || originHost !== req.headers.host) {
+          return sendError(res, 403, '拒绝跨站请求')
+        }
+      }
+      const fetchSite = req.headers['sec-fetch-site']
+      if (typeof fetchSite === 'string' && fetchSite !== 'same-origin' && fetchSite !== 'same-site' && fetchSite !== 'none') {
+        return sendError(res, 403, '拒绝跨站请求')
+      }
+      // A body must be JSON; urlencoded/text/plain (the CSRF-capable types)
+      // never reach a handler.
+      const hasBody = req.headers['content-length'] !== undefined
+        || req.headers['transfer-encoding'] !== undefined
+      const contentType = String(req.headers['content-type'] ?? '').toLowerCase()
+      if (hasBody && !contentType.includes('application/json')) {
+        return sendError(res, 415, '仅接受 application/json 请求体')
+      }
+    }
+
     // ── state ──
     if ((seg.length === 1 || (seg.length === 2 && seg[1] === 'state')) && method === 'GET') {
       const plays = storage.listPlays()
@@ -156,6 +236,7 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
         defaultPresetId: storage.snapshot().defaultPresetId,
         style: storage.snapshot().style,
         multiAgentAvailable: deps.multiAgentAvailable(),
+        swipes: (storage.snapshot().branches ?? []).map(toSwipeSummary),
       })
     }
 
@@ -267,14 +348,20 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
         const character = storage.getCharacter(seg[2]!)
         if (character === undefined) return sendError(res, 404, '角色不存在')
         const avatar = await deps.avatars.readCharacter(character)
-        const png = encodePngCard(JSON.stringify(character.card), avatar)
+        const encoded = encodePngCardResult(JSON.stringify(character.card), avatar)
         const name = character.card.data.name.replace(/[\\/:*?"<>|]/g, '_') || 'character'
+        // A jpeg/webp/gif avatar cannot be embedded in a PNG card without
+        // transcoding, so the card falls back to a blank image. Say so in a
+        // header instead of silently shipping a card with no portrait.
         res.writeHead(200, {
           'content-type': 'image/png',
-          'content-length': png.length,
+          'content-length': encoded.png.length,
           'content-disposition': contentDisposition(`${name}.png`),
+          ...(avatar !== undefined && !encoded.avatarEmbedded
+            ? { 'x-tavern-avatar': 'omitted-unsupported-format' }
+            : {}),
         })
-        res.end(png)
+        res.end(encoded.png)
         return
       }
     }
@@ -463,6 +550,34 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
         if (play === undefined) return sendError(res, 404, '酒馆会话不存在')
         return sendJson(res, 200, play)
       }
+      // Retry: regenerate the last assistant reply as a new swipe variant.
+      if (seg.length === 5 && seg[3] === 'messages' && seg[4] === 'retry' && method === 'POST') {
+        const result = await runtime.reroll(seg[2]!)
+        return sendJson(res, 200, { play: result.play, branch: toSwipeSummary(result.branch) })
+      }
+      // Swipe: materialize another stored variant of the current branch.
+      if (seg.length === 5 && seg[3] === 'messages' && seg[4] === 'swipe' && method === 'POST') {
+        const body = (await readJsonBody(req)) as { key?: unknown; step?: unknown } | undefined
+        if (typeof body?.key !== 'string' || typeof body?.step !== 'number') {
+          return sendError(res, 400, '需要分支 key 与移动方向 step')
+        }
+        const result = await runtime.swipe(seg[2]!, body.key, body.step)
+        return sendJson(res, 200, { play: result.play, branch: toSwipeSummary(result.branch) })
+      }
+      // Edit one user message and regenerate from it.
+      if (seg.length === 6 && seg[3] === 'messages' && seg[5] === 'retry' && method === 'POST') {
+        const body = (await readJsonBody(req)) as { text?: unknown } | undefined
+        if (typeof body?.text !== 'string') return sendError(res, 400, '缺少修改后的内容')
+        const play = await runtime.editUserAndRetry(seg[2]!, seg[4]!, body.text)
+        return sendJson(res, 200, { play })
+      }
+      // Edit one assistant reply in place (no regeneration).
+      if (seg.length === 5 && seg[3] === 'messages' && method === 'PUT') {
+        const body = (await readJsonBody(req)) as { text?: unknown } | undefined
+        if (typeof body?.text !== 'string') return sendError(res, 400, '缺少修改后的内容')
+        const play = await runtime.editAssistant(seg[2]!, seg[4]!, body.text)
+        return sendJson(res, 200, { play })
+      }
       // Activate (create or resume) the play's director session.
       if (seg.length === 4 && seg[3] === 'activate' && method === 'POST') {
         const play = storage.getPlay(seg[2]!)
@@ -537,10 +652,17 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
 
     return sendError(res, 404, '未知接口')
   } catch (error: unknown) {
+    // Validation failures are the caller's problem and carry their own status
+    // and a message that is safe to display. Everything else stays opaque.
+    if (error instanceof TavernUserError) {
+      return sendError(res, error.status, error.message)
+    }
     if (error instanceof SyntaxError) {
       return sendError(res, 400, `JSON 格式错误：${error.message}`)
     }
     deps.logger.warn(`tavern api error: ${String(error)}`)
-    return sendError(res, 500, error instanceof Error ? error.message : String(error))
+    // Internal error text (paths, stack details) stays in the log; the
+    // client gets a generic message.
+    return sendError(res, 500, '服务器内部错误')
   }
 }

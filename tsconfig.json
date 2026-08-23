@@ -1,4 +1,14 @@
 {
+  /* Editor/tsdown default. The authoritative programs are tsconfig.host.json
+     and tsconfig.client.json (`pnpm typecheck` runs both); this file exists so
+     an IDE opening any file in src/ resolves imports the same way.
+
+     It deliberately carries NO absolute `paths`. It used to point
+     `@deepseek-ai/*` at one machine's npx cache directory — a path that broke
+     for every other clone, leaked the author's Windows user name into a public
+     repository, and had since stopped existing even locally. `@deepseek-ai/*`
+     now resolves through node_modules like any other dependency; see the
+     README for how to provide that tree. */
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
@@ -6,9 +16,10 @@
     "moduleResolution": "Bundler",
     "allowImportingTsExtensions": true,
     "strict": true,
-    "noImplicitAny": true,
     "noUncheckedIndexedAccess": true,
     "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
     "verbatimModuleSyntax": true,
     "jsx": "react-jsx",
     "skipLibCheck": true,
@@ -17,8 +28,8 @@
     "isolatedModules": true,
     "forceConsistentCasingInFileNames": true,
     "paths": {
-      "@deepseek-ai/*": [
-        "C:/Users/lthwc/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/*"
+      "@deepseek-ai/dsh-client-ui-slots": [
+        "./.ref/dsh/packages/client/ui-slots/src/index.ts"
       ]
     }
   },
