@@ -14,6 +14,9 @@ import type { CharacterRecord } from './types.ts'
 /** Directory prefix persisted in `character.avatar` (portable, `/`-separated). */
 export const AVATAR_DIR_RELATIVE = 'tavern/avatars'
 
+/** Every extension this store may write for one character id. */
+const AVATAR_EXTENSIONS = ['png', 'jpg', 'jpeg', 'webp', 'gif'] as const
+
 const SAFE_FILE_RE = /^[a-zA-Z0-9_-]+\.(?:png|jpg|jpeg|webp|gif)$/i
 const DATA_URL_RE = /^data:(image\/(?:png|jpeg|jpg|webp|gif));base64,([A-Za-z0-9+/=\r\n]+)$/i
 const MIME_TYPES: Record<string, string> = {
@@ -24,17 +27,37 @@ const MIME_TYPES: Record<string, string> = {
   'image/gif': 'image/gif',
 }
 
+/**
+ * Largest decoded avatar this store accepts.  The settings document is
+ * rewritten in full on every library mutation, so an inline value that never
+ * makes it onto disk is copied again on every later write; anything past the
+ * cap is dropped instead of being carried around forever.
+ */
+const MAX_AVATAR_BYTES = 8 * 1024 * 1024
+/** base64 spends 4 characters per 3 bytes: bound the string before decoding. */
+const MAX_AVATAR_DATA_URL_LENGTH = Math.ceil(MAX_AVATAR_BYTES / 3) * 4 + 64
+
 function extensionForMime(mime: string): string {
   return mime === 'image/jpeg' || mime === 'image/jpg' ? 'jpg' : mime.slice('image/'.length)
 }
 
 function decodeDataUrl(value: string): { bytes: Buffer; mime: string; extension: string } | undefined {
-  const match = DATA_URL_RE.exec(value.trim())
+  const trimmed = value.trim()
+  // Checked before `Buffer.from`, which would otherwise allocate the whole
+  // payload only to have it rejected on the next line.
+  if (trimmed.length > MAX_AVATAR_DATA_URL_LENGTH) return undefined
+  const match = DATA_URL_RE.exec(trimmed)
   if (match === null || match[1] === undefined || match[2] === undefined) return undefined
   const mime = match[1].toLowerCase()
   const bytes = Buffer.from(match[2], 'base64')
-  if (bytes.length === 0) return undefined
+  if (bytes.length === 0 || bytes.length > MAX_AVATAR_BYTES) return undefined
   return { bytes, mime, extension: extensionForMime(mime) }
+}
+
+/** Strip the avatar entirely (the key is omitted, not set to `null`). */
+function withoutAvatar(record: CharacterRecord): CharacterRecord {
+  const { avatar: _dropped, ...rest } = record
+  return rest
 }
 
 function safeFile(id: string, extension: string): string | undefined {
@@ -61,7 +84,11 @@ function fileFromAvatar(avatar: string | undefined): string | undefined {
 export class AvatarStore {
   constructor(
     readonly root: string,
-    private readonly logger: Pick<LoggerService, 'warn'>,
+    /**
+     * The plugin logger.  Public because the TauriTavern importer runs as plain
+     * functions with no logger of their own and already receives this store.
+     */
+    readonly logger: Pick<LoggerService, 'warn'>,
   ) {}
 
   private filePath(file: string): string {
@@ -75,19 +102,27 @@ export class AvatarStore {
   /**
    * Replace a character's data-URL avatar with an on-disk file and return the
    * record that should be persisted.  Records that already use a relative path
-   * (or have no avatar) are returned unchanged.
+   * (or have no avatar) are returned unchanged.  A value this store could never
+   * have produced is dropped rather than written back: the HTTP body cap is the
+   * only limit on what a client can put in `avatar`, and whatever lands in the
+   * settings document is re-serialized on every later library mutation.
    */
   async materializeCharacter(
     record: CharacterRecord,
     previous?: CharacterRecord,
   ): Promise<CharacterRecord> {
     const avatar = record.avatar
-    if (avatar === undefined || !avatar.startsWith('data:')) return record
+    if (avatar === undefined) return record
+    if (!avatar.startsWith('data:')) {
+      if (fileFromAvatar(avatar) !== undefined) return record
+      this.logger.warn('tavern avatar: dropping unrecognized avatar value for character %s', record.id)
+      return withoutAvatar(record)
+    }
 
     const decoded = decodeDataUrl(avatar)
     if (decoded === undefined) {
-      this.logger.warn('tavern avatar: unsupported data URL for character %s; leaving it inline', record.id)
-      return record
+      this.logger.warn('tavern avatar: dropping unsupported or oversized avatar for character %s', record.id)
+      return withoutAvatar(record)
     }
 
     const file = safeFile(record.id, decoded.extension)
@@ -98,20 +133,43 @@ export class AvatarStore {
 
     await this.ensureRoot()
     await writeFile(this.filePath(file), decoded.bytes)
-
-    // The same character id was previously persisted under a different image
-    // extension; remove the stale file once the replacement is durable.
-    const previousFile = previous !== undefined ? fileFromAvatar(previous.avatar) : undefined
-    if (previousFile !== undefined && previousFile.toLowerCase() !== file.toLowerCase()) {
-      await rm(this.filePath(previousFile), { force: true }).catch(() => void 0)
-    }
+    await this.removeStale(record.id, file, previous)
 
     return { ...record, avatar: relativeAvatar(file) }
   }
 
-  /** Materialize every data-URL avatar in one batch (used by the importer). */
+  /**
+   * Drop leftovers for the same character once the replacement is durable.  The
+   * id alone defines the candidate names because the bulk import path has no
+   * `previous` record to compare against, so a changed image extension would
+   * otherwise strand the old file forever.
+   */
+  private async removeStale(id: string, current: string, previous?: CharacterRecord): Promise<void> {
+    const names = new Set(AVATAR_EXTENSIONS
+      .map(extension => safeFile(id, extension))
+      .filter((name): name is string => name !== undefined))
+    const previousFile = previous !== undefined ? fileFromAvatar(previous.avatar) : undefined
+    if (previousFile !== undefined) names.add(previousFile)
+    for (const name of names) {
+      if (name.toLowerCase() === current.toLowerCase()) continue
+      await rm(this.filePath(name), { force: true }).catch(() => void 0)
+    }
+  }
+
+  /**
+   * Materialize every data-URL avatar in one batch (used by the importer).
+   * Settled, not `all`: one unwritable avatar (EACCES/ENOSPC) used to reject the
+   * whole call, which aborted the import before anything was persisted and left
+   * the user with an empty result and no explanation.
+   */
   async materializeCharacters(records: CharacterRecord[]): Promise<CharacterRecord[]> {
-    return Promise.all(records.map(record => this.materializeCharacter(record)))
+    const settled = await Promise.allSettled(records.map(record => this.materializeCharacter(record)))
+    return settled.map((result, index) => {
+      const record = records[index]!
+      if (result.status === 'fulfilled') return result.value
+      this.logger.warn('tavern avatar: failed to store avatar for %s: %s', record.id, String(result.reason))
+      return record
+    })
   }
 
   /**
