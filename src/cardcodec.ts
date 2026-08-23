@@ -11,11 +11,21 @@ import { parsePngCard } from './png.ts'
 
 // ── Character cards ────────────────────────────────────────────────────────
 
-const V2_REQUIRED: readonly (keyof CharacterCardData)[] = [
+/** `data` keys the canonical v2 card carries as first-class fields. */
+const MAPPED_CARD_FIELDS = new Set([
   'name', 'description', 'personality', 'scenario', 'first_mes', 'mes_example',
-  'creator_notes', 'system_prompt', 'post_history_instructions',
-  'alternate_greetings', 'tags', 'creator', 'character_version', 'extensions',
-]
+  'creator_notes', 'system_prompt', 'post_history_instructions', 'alternate_greetings',
+  'group_only_greetings', 'character_book', 'tags', 'creator', 'character_version',
+  'extensions',
+])
+
+/**
+ * v3 adds `data` fields (nickname, assets, creation_date, source, …) that the
+ * v2 envelope has no slot for. Dropping them made every re-export lossy for
+ * the original author, so the unmapped keys ride along under one namespaced
+ * extension key and survive the round trip untouched.
+ */
+const SOURCE_FIELDS_KEY = 'dsh_tavern_source_fields'
 
 /** Normalize raw card JSON (v1/v2/v3) into a canonical v2 card. */
 export function normalizeCard(raw: unknown, sourceName?: string): CharacterCard {
@@ -47,25 +57,20 @@ export function normalizeCard(raw: unknown, sourceName?: string): CharacterCard 
     tags: strArray(dataRaw.tags),
     creator: str(dataRaw.creator),
     character_version: str(dataRaw.character_version),
-    extensions: typeof dataRaw.extensions === 'object' && dataRaw.extensions !== null
-      ? dataRaw.extensions as Record<string, unknown>
-      : {},
+    extensions: cardExtensions(dataRaw, dataRaw !== obj),
   }
-  // v1 cards lack the data wrapper; fill every required key.
-  for (const key of V2_REQUIRED) {
-    const value = data[key]
-    if (value === undefined) {
-      (data as unknown as Record<string, unknown>)[key] = Array.isArray(value)
-        ? []
-        : key === 'extensions' ? {} : ''
-    }
-  }
+  // The object literal above sets every spec-required key (strings via str(),
+  // arrays via strArray(), extensions via an object check), so no post-fill
+  // pass is needed — a previous loop here could only ever produce the wrong
+  // default type for array/object fields.
   if (data.name.trim() === '') {
     throw new Error(`人物卡缺少名称${sourceName !== undefined ? `（${sourceName}）` : ''}`)
   }
   return {
     spec: 'chara_card_v2',
-    spec_version: typeof obj.spec_version === 'string' ? obj.spec_version : '2.0',
+    // `spec` is hardcoded, so echoing the source version would emit an
+    // envelope no reader accepts — a v2 card claiming spec_version "3.0".
+    spec_version: '2.0',
     data,
   }
 }
@@ -97,6 +102,28 @@ export function avatarDataUrl(bytes: Uint8Array): string | undefined {
 function isWorldBookish(value: unknown): boolean {
   return typeof value === 'object' && value !== null
     && ('entries' in value)
+}
+
+/** Copy the extension block, folding in any `data` field the v2 card drops. */
+function cardExtensions(dataRaw: Record<string, unknown>, wrapped: boolean): Record<string, unknown> {
+  const extensions: Record<string, unknown> = typeof dataRaw.extensions === 'object' && dataRaw.extensions !== null
+    ? { ...dataRaw.extensions as Record<string, unknown> }
+    : {}
+  // Only the wrapped (spec + data) form has a known field list; a bare v1
+  // card's top level is ST bookkeeping (chat, avatar, fav, …) and must not be
+  // hoovered into extensions.
+  if (!wrapped) return extensions
+  const extra: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(dataRaw)) {
+    if (!MAPPED_CARD_FIELDS.has(key)) extra[key] = value
+  }
+  if (Object.keys(extra).length === 0) return extensions
+  const previous = extensions[SOURCE_FIELDS_KEY]
+  extensions[SOURCE_FIELDS_KEY] = {
+    ...(typeof previous === 'object' && previous !== null ? previous as Record<string, unknown> : {}),
+    ...extra,
+  }
+  return extensions
 }
 
 // ── World books ────────────────────────────────────────────────────────────
@@ -161,6 +188,10 @@ function normalizeEntry(raw: Record<string, unknown>, uid: number): WorldBookEnt
   const bool = (v: unknown, fallback: boolean): boolean => typeof v === 'boolean' ? v : fallback
   const num = (v: unknown, fallback: number): number => typeof v === 'number' && Number.isFinite(v) ? v : fallback
   const nullableNum = (v: unknown): number | null => typeof v === 'number' && Number.isFinite(v) ? v : null
+  // "Unset" is meaningful for these tri-state flags (null = inherit the global
+  // setting), so they need their own probe: nullableNum rejects every boolean
+  // and would pin the field to null forever.
+  const nullableBool = (v: unknown): boolean | null => typeof v === 'boolean' ? v : null
 
   entry.key = strArray(raw.key)
   entry.keysecondary = strArray(raw.keysecondary)
@@ -192,15 +223,9 @@ function normalizeEntry(raw: Record<string, unknown>, uid: number): WorldBookEnt
   entry.groupOverride = bool(pick('groupOverride', 'group_override'), false)
   entry.groupWeight = num(pick('groupWeight', 'group_weight'), 100)
   entry.scanDepth = nullableNum(pick('scanDepth', 'scan_depth'))
-  entry.caseSensitive = nullableNum(pick('caseSensitive', 'case_sensitive')) === null
-    ? null
-    : bool(pick('caseSensitive', 'case_sensitive'), false)
-  entry.matchWholeWords = nullableNum(pick('matchWholeWords', 'match_whole_words')) === null
-    ? null
-    : bool(pick('matchWholeWords', 'match_whole_words'), false)
-  entry.useGroupScoring = nullableNum(pick('useGroupScoring', 'use_group_scoring')) === null
-    ? null
-    : bool(pick('useGroupScoring', 'use_group_scoring'), false)
+  entry.caseSensitive = nullableBool(pick('caseSensitive', 'case_sensitive'))
+  entry.matchWholeWords = nullableBool(pick('matchWholeWords', 'match_whole_words'))
+  entry.useGroupScoring = nullableBool(pick('useGroupScoring', 'use_group_scoring'))
   entry.automationId = str(pick('automationId', 'automation_id'))
   entry.role = num(pick('role', 'role'), 0)
   entry.sticky = nullableNum(pick('sticky', 'sticky'))
@@ -211,6 +236,32 @@ function normalizeEntry(raw: Record<string, unknown>, uid: number): WorldBookEnt
   // Keep the extension block for round-trip fidelity.
   entry.extensions = { ...ext }
   return entry
+}
+
+/** A usable uid candidate, or undefined when the source has none. */
+function safeUid(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined
+}
+
+/**
+ * The uid doubles as the object key in the ST world-info file form, so two
+ * entries sharing one uid collapse into a single key and the earlier entry is
+ * lost on export. Explicit uids are reserved up front and only the missing or
+ * duplicated ones are moved, so hand-numbered books keep their numbering.
+ */
+function resolveUids(candidates: readonly (number | undefined)[]): number[] {
+  const reserved = new Set<number>(candidates.filter((uid): uid is number => uid !== undefined))
+  const used = new Set<number>()
+  let next = 0
+  return candidates.map((uid) => {
+    if (uid !== undefined && !used.has(uid)) {
+      used.add(uid)
+      return uid
+    }
+    while (reserved.has(next) || used.has(next)) next++
+    used.add(next)
+    return next
+  })
 }
 
 /**
@@ -226,20 +277,17 @@ export function normalizeWorldBook(raw: unknown): WorldBook {
   const entriesRaw = obj.entries
   let entries: WorldBookEntry[]
   if (Array.isArray(entriesRaw)) {
-    entries = entriesRaw
+    const items = entriesRaw
       .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
-      .map((item, index) => {
-        const uid = typeof item.uid === 'number' && Number.isSafeInteger(item.uid) ? item.uid : index
-        return normalizeEntry(item, uid)
-      })
+    const uids = resolveUids(items.map(item => safeUid(item.uid)))
+    entries = items.map((item, index) => normalizeEntry(item, uids[index]!))
   } else if (typeof entriesRaw === 'object' && entriesRaw !== null) {
     // ST world-info file: entries keyed by string uid.
-    entries = Object.entries(entriesRaw as Record<string, unknown>)
-      .filter(([, item]) => typeof item === 'object' && item !== null)
-      .map(([uid, item], index) => {
-        const parsed = Number(uid)
-        return normalizeEntry(item as Record<string, unknown>, Number.isSafeInteger(parsed) ? parsed : index)
-      })
+    const items = Object.entries(entriesRaw as Record<string, unknown>)
+      .filter((pair): pair is [string, Record<string, unknown>] =>
+        typeof pair[1] === 'object' && pair[1] !== null)
+    const uids = resolveUids(items.map(([key, item]) => safeUid(Number(key)) ?? safeUid(item.uid)))
+    entries = items.map(([, item], index) => normalizeEntry(item, uids[index]!))
   } else {
     entries = []
   }
@@ -259,8 +307,17 @@ export function normalizeWorldBook(raw: unknown): WorldBook {
 /** Serialize a tavern book into the ST world-info file form (uid-keyed object). */
 export function serializeWorldBookFile(book: WorldBook): Record<string, unknown> {
   const entries: Record<string, unknown> = {}
+  let spare = 0
   for (const entry of book.entries) {
-    entries[String(entry.uid)] = serializeEntry(entry)
+    // Defensive net for books that predate uid normalization: a repeat uid
+    // would overwrite — and silently delete — the entry written before it, so
+    // park the duplicate on the next free key instead.
+    let uid = entry.uid
+    if (Object.prototype.hasOwnProperty.call(entries, String(uid))) {
+      while (Object.prototype.hasOwnProperty.call(entries, String(spare))) spare++
+      uid = spare
+    }
+    entries[String(uid)] = { ...serializeEntry(entry), uid }
   }
   return {
     ...(book.name !== undefined ? { name: book.name } : {}),
@@ -279,7 +336,10 @@ function serializeEntry(entry: WorldBookEntry): Record<string, unknown> {
     ...entry.extensions,
     position: entry.position,
     exclude_recursion: entry.excludeRecursion,
-    display_index: entry.order,
+    // display_index is the editor's row order and `order` is the injection
+    // priority — independent in ST, so only fall back when there is no row
+    // order to preserve.
+    display_index: entry.extensions.display_index ?? entry.order,
     probability: entry.probability,
     useProbability: entry.useProbability,
     depth: entry.depth,

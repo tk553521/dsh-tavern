@@ -59,10 +59,16 @@ export function parsePngCard(buffer: Buffer): { json: string; avatar?: Buffer } 
     if (isTextChunk(current.type)) {
       const text = parseTextChunk(current.type, current.data)
       if (text !== null) {
-        if (text.keyword.toLowerCase() === CCV3_KEYWORD) {
-          ccv3Text = decodeCardText(text.text)
-        } else if (text.keyword.toLowerCase() === CHARA_KEYWORD && charaText === undefined) {
-          charaText = decodeCardText(text.text)
+        const keyword = text.keyword.toLowerCase()
+        // The first *decodable* chunk wins for each keyword: some exporters
+        // append a second, empty `ccv3`/`chara` chunk, and letting it through
+        // would blank out the card the earlier chunk already carried.
+        if (keyword === CCV3_KEYWORD && ccv3Text === undefined) {
+          const decoded = decodeCardText(text.payload)
+          if (decoded !== undefined) ccv3Text = decoded
+        } else if (keyword === CHARA_KEYWORD && charaText === undefined) {
+          const decoded = decodeCardText(text.payload)
+          if (decoded !== undefined) charaText = decoded
         }
       }
     }
@@ -79,7 +85,20 @@ export function parsePngCard(buffer: Buffer): { json: string; avatar?: Buffer } 
 
 interface ParsedText {
   keyword: string
-  text: string
+  /**
+   * The payload bytes, inflated for zTXt/iTXt but otherwise untouched: the
+   * card text is either Base64 (pure ASCII) or raw UTF-8 JSON, and only the
+   * decoder can tell which, so the encoding choice must not be made here.
+   */
+  payload: Buffer
+}
+
+/** Hard cap on inflated card text: a real card is tens of KB; a crafted
+    zTXt/iTXt block can otherwise expand to gigabytes (decompression bomb). */
+const MAX_CARD_TEXT_BYTES = 8 * 1024 * 1024
+
+function inflateBounded(compressed: Buffer): Buffer {
+  return zlib.inflateSync(compressed, { maxOutputLength: MAX_CARD_TEXT_BYTES })
 }
 
 function parseTextChunk(type: string, data: Buffer): ParsedText | null {
@@ -89,13 +108,13 @@ function parseTextChunk(type: string, data: Buffer): ParsedText | null {
   const payload = data.subarray(nul + 1)
   try {
     if (type === 'tEXt') {
-      return { keyword, text: payload.toString('latin1') }
+      return { keyword, payload }
     }
     if (type === 'zTXt') {
       // byte 0 = compression method (0 = zlib).
       if (payload.length < 1 || payload[0] !== 0) return null
       const compressed = payload.subarray(1)
-      return { keyword, text: zlib.inflateSync(compressed).toString('utf8') }
+      return { keyword, payload: inflateBounded(compressed) }
     }
     if (type === 'iTXt') {
       const compressionFlag = payload[0]
@@ -104,10 +123,7 @@ function parseTextChunk(type: string, data: Buffer): ParsedText | null {
       const keyNul = payload.indexOf(0, langNul + 1)
       if (keyNul < 0) return null
       const raw = payload.subarray(keyNul + 1)
-      const text = compressionFlag === 1
-        ? zlib.inflateSync(raw).toString('utf8')
-        : raw.toString('utf8')
-      return { keyword, text }
+      return { keyword, payload: compressionFlag === 1 ? inflateBounded(raw) : raw }
     }
   } catch {
     return null
@@ -115,8 +131,10 @@ function parseTextChunk(type: string, data: Buffer): ParsedText | null {
   return null
 }
 
-function decodeCardText(raw: string): string | undefined {
-  const trimmed = raw.trim()
+function decodeCardText(payload: Buffer): string | undefined {
+  // Base64 is ASCII, so the Latin-1 view is a faithful lens on the encoded
+  // form and — unlike a UTF-8 read — never injects replacement characters.
+  const trimmed = payload.toString('latin1').trim()
   if (trimmed === '') return undefined
   // Standard cards base64-encode the JSON; some tools store plain JSON.
   try {
@@ -125,7 +143,11 @@ function decodeCardText(raw: string): string | undefined {
   } catch {
     // Not base64; fall through to plain text.
   }
-  if (trimmed.startsWith('{')) return trimmed
+  // Plain JSON has to be read as UTF-8: tEXt is nominally Latin-1, but every
+  // real writer emits UTF-8 bytes, and a Latin-1 read mangles non-ASCII names
+  // into mojibake that still parses as JSON — silent corruption.
+  const plain = payload.toString('utf8').trim()
+  if (plain.startsWith('{')) return plain
   return undefined
 }
 
@@ -206,9 +228,15 @@ function blankPngChunks(): PngChunk[] {
  * keyword `chara`). The text chunk is inserted BEFORE IEND, as PNG requires.
  * When `avatar` is a PNG buffer its image chunks are reused; otherwise a 1x1
  * transparent PNG is emitted.
+ *
+ * `avatarEmbedded` exists because the avatar store also accepts jpeg/webp/gif
+ * and this encoder has no transcoder: those formats fall back to the blank
+ * image, which is indistinguishable from "no avatar" in the output bytes. The
+ * flag lets a caller warn the user instead of shipping a blank card silently.
  */
-export function encodePngCard(json: string, avatar?: Buffer): Buffer {
-  const chunks = avatar !== undefined ? imageChunks(avatar) ?? blankPngChunks() : blankPngChunks()
+export function encodePngCardResult(json: string, avatar?: Buffer): { png: Buffer; avatarEmbedded: boolean } {
+  const embedded = avatar !== undefined ? imageChunks(avatar) : null
+  const chunks = embedded ?? blankPngChunks()
   const textData = Buffer.concat([
     Buffer.from(`${CHARA_KEYWORD}\0`, 'latin1'),
     Buffer.from(Buffer.from(json, 'utf8').toString('base64'), 'latin1'),
@@ -220,5 +248,13 @@ export function encodePngCard(json: string, avatar?: Buffer): Buffer {
     data: textData,
     raw: textChunk,
   })
-  return Buffer.concat([PNG_SIGNATURE, ...chunks.map(c => c.raw)])
+  return {
+    png: Buffer.concat([PNG_SIGNATURE, ...chunks.map(c => c.raw)]),
+    avatarEmbedded: embedded !== null,
+  }
+}
+
+/** {@link encodePngCardResult} without the avatar-embedding report. */
+export function encodePngCard(json: string, avatar?: Buffer): Buffer {
+  return encodePngCardResult(json, avatar).png
 }
