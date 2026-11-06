@@ -18,15 +18,15 @@
 import { createHash } from 'node:crypto'
 import type { LoggerService } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AgentRegistry, AgentSetup } from '@deepseek-ai/dsh-agent'
-import type { AgentPresets } from '@deepseek-ai/dsh-agent-presets'
+import type { AgentPresetRegistry } from '@deepseek-ai/dsh-agent-preset-registry'
 import type { MessageId, UserMessage } from '@deepseek-ai/dsh-llm'
-import type { Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent, SessionHeader, SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import type SessionPersistence from '@deepseek-ai/dsh-session-persistence'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
 import type { CharacterRecord, Play, Preset, SwipeBranch, WorldBookRecord } from './types.ts'
 import { TavernStorage, newId, nowIso } from './storage.ts'
-import { activateBook, hashSeed, renderWorldInfo, type ActivatedEntry } from './lorebook.ts'
+import { activateBooks, hashSeed, renderWorldInfo, type ActivatedEntry } from './lorebook.ts'
 import { TAVERN_PRESET_ID } from './tavern-preset.ts'
 import { badRequest, conflict, notFound } from './errors.ts'
 import type { TavernConfig } from './config.ts'
@@ -36,15 +36,24 @@ import {
 } from './prompt.ts'
 
 /**
- * The system-prompt persona slot the tavern director/character prompts take
- * over. Mirrors `PERSONA_SECTION`/`PERSONA_ORDER` from dsh-system-prompt
- * (hardcoded to keep the host half free of @deepseek-ai runtime imports):
- * registering under this name shadows the preset persona in the agent scope,
- * so the tavern prompt and the preset's fixed persona never fight over the
- * complete-section slot.
+ * The system-prompt section the tavern director/character prompt takes over.
+ *
+ * The host's own persona sections are `deployment:persona-prefix` and
+ * `deployment:persona-suffix` (`dsh-system-prompt` registers them
+ * unconditionally). The tavern does NOT reuse either name: a section name is a
+ * key in one scope's layer, so reusing it either throws "already registered in
+ * this scope" or shadows the host's section depending on which layer the
+ * preset mount lands in — neither is a behaviour worth depending on.
+ *
+ * What actually makes the character-card prompt the whole system prompt is
+ * `complete: true` below: prompt assembly folds every other section away when
+ * exactly one complete section is active, and refuses to assemble when more
+ * than one is. That is why the registered tavern preset marks its own persona
+ * row `complete: false` — otherwise every assembly would throw.
  */
-const PERSONA_SECTION = 'deployment:persona'
-const PERSONA_ORDER = 0
+const TAVERN_SECTION = 'tavern:persona'
+/** Same order as the host's `deployment:persona-prefix` slot (0). */
+const TAVERN_ORDER = 0
 
 /** Resolve the effective world-book ids for a play (new array field + legacy scalar field). */
 export function playLorebookIds(play: Pick<Play, 'lorebookIds' | 'lorebookId'>): string[] {
@@ -61,7 +70,7 @@ export interface PlayRuntimeDeps {
   storage: TavernStorage
   agents: AgentRegistry
   /** Agent-preset roster: mounts the tavern preset for play sessions. */
-  agentPresets: AgentPresets
+  agentPresets: AgentPresetRegistry
   /**
    * Workspace registry probe. Archiving a play session out of the 对话 page is
    * best-effort, so this is an OPTIONAL dependency resolved per call
@@ -80,13 +89,36 @@ export interface PlayRuntimeDeps {
   config: TavernConfig
 }
 
+/**
+ * Admit a number as a session event position.
+ *
+ * Mirrors the host's `SessionSeq()` helper (a `number` brand plus a safety
+ * check). It is re-implemented here rather than imported because the host half
+ * must not carry ANY runtime `@deepseek-ai` import — the installed profile has
+ * no such package tree, so an import would fail module resolution and the
+ * plugin would never load (guarded by `scripts/verify/plugin.mjs`).
+ * @param value - the event position to admit.
+ * @returns the same number, branded.
+ */
+function sessionSeq(value: number): SessionSeq {
+  if (!Number.isSafeInteger(value) || value < 0 || Object.is(value, -0)) {
+    throw new TypeError(`SessionSeq must be a non-negative safe integer, got ${String(value)}`)
+  }
+  return value as unknown as SessionSeq
+}
+
 /** Build a user message carrying tavern plugin provenance. */
 function userMessage(content: string): UserMessage {
   return {
     id: crypto.randomUUID() as MessageId,
     role: 'user',
     content: [{ type: 'text', text: content }],
-    source: { kind: 'plugin', plugin: 'dsh-tavern' },
+    // `MessageSourceMap` in 0.2.2-alpha.3 is `user | model | tool |
+    // system-prompt`; the old `{ kind: 'plugin', plugin }` arm is gone and a
+    // message carrying it is rejected by the session's event validation. A
+    // tavern prompt is a user-role prompt injected by the plugin, and `user`
+    // is the arm that says "not the model, not a tool".
+    source: { kind: 'user' },
   }
 }
 
@@ -112,7 +144,9 @@ function roleSessionId(playId: string, characterId: string): SessionId {
 
 /** Extract the final assistant text from an agent's session log. */
 export function lastAssistantText(session: Session): string {
-  const events = session.events
+  // `Session.events` is gone in 0.2.2-alpha.3; the log is read through
+  // `snapshotEvents()` (a frozen, detached array of the selected range).
+  const events = session.snapshotEvents()
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index]
     if (event === undefined) continue
@@ -148,13 +182,24 @@ function resolveModel(
   }
 }
 
-/** Build a balanced completed-turn seed carrying the greeting. */
-function greetingSeed(greeting: string, provider: string, model: string): SessionEvent[] {
+/**
+ * Build a balanced completed-turn seed carrying the greeting.
+ *
+ * Exported so `scripts/verify/seed.mjs` can push the exact same events through
+ * the host's real `Session.create` validator: this is the only place the plugin
+ * fabricates session events, and a seed the host rejects fails every new play at
+ * creation time (the play record is then rolled back by the caller).
+ * @param greeting - the card's first message (or an alternate greeting).
+ * @param provider - provider route recorded on the assistant message.
+ * @param model - model id recorded on the assistant message.
+ * @returns four contiguous events: turn/start, user/message, assistant/message, turn/end.
+ */
+export function greetingSeed(greeting: string, provider: string, model: string): SessionEvent[] {
   const safeGreeting = stripPromptVariables(greeting)
   const time = Date.now()
-  const assistant: SessionEvent = {
+  const assistant = {
     type: 'assistant/message',
-    seq: 2,
+    seq: sessionSeq(2),
     time,
     data: {
       turn: 1,
@@ -165,18 +210,49 @@ function greetingSeed(greeting: string, provider: string, model: string): Sessio
         content: [{ type: 'text', text: safeGreeting }],
         source: { kind: 'model', provider, model },
       },
+      // Session format 4 made the raw stream a required field of
+      // `assistant/message` (`stream: AssistantStreamRecord[]`): the durable
+      // record is the settlement of a model attempt, and a fabricated greeting
+      // has no attempt behind it. An empty stream is the honest encoding of
+      // "this text did not come from a provider stream"; the separate
+      // `assistant/attempt` event type exists precisely for attempts that
+      // produced no message.
+      stream: [],
     },
     surfaceOp: 'append',
-  }
+  } satisfies SessionEvent
   return [
-    { type: 'turn/start', seq: 0, time, data: { turn: 1 } },
-    { type: 'user/message', seq: 1, time, data: userMessage('[开场] 扮演开始。'), surfaceOp: 'append' },
+    { type: 'turn/start', seq: sessionSeq(0), time, data: { turn: 1 } },
+    {
+      type: 'user/message',
+      seq: sessionSeq(1),
+      time,
+      data: userMessage('[开场] 扮演开始。'),
+      surfaceOp: 'append',
+    },
     assistant,
-    { type: 'turn/end', seq: 3, time, data: { turn: 1, reason: { kind: 'completed' } } },
+    { type: 'turn/end', seq: sessionSeq(3), time, data: { turn: 1, reason: { kind: 'completed' } } },
   ]
 }
 
-/** Dynamic world-book context for one play's agent assembly. */
+/**
+ * What a persisted session probe found.
+ *
+ * "No session yet" and "a session that records no preset" are different states
+ * that both used to collapse into `undefined`; the caller answers `undefined`
+ * with `agents.create(...)`, which the store rejects with
+ * `SessionAlreadyExistsError` for an id that already exists. A play created
+ * before the tavern preset existed (or one whose preset was deleted) would then
+ * fail to OPEN on every activation, with no log line explaining why.
+ */
+export interface PersistedSessionState {
+  /** Whether the store has this session at all. */
+  exists: boolean
+  /** The preset recorded for it, or undefined when it was composed bare. */
+  preset: string | undefined
+}
+
+/** The dynamic world-book context for one play's agent assembly. */
 export type LoreContext = {
   name: string
   order: number
@@ -199,7 +275,17 @@ export class TavernSessionRuntime {
   /** `${playId}:${characterId}` → in-flight role assembly (same race as the director). */
   private readonly roleInflight = new Map<string, Promise<AgentHandle>>()
 
-  constructor(private readonly deps: PlayRuntimeDeps) {}
+  /**
+   * Declared explicitly rather than as a constructor parameter property: this
+   * module is imported directly by `scripts/verify/*.mjs`, which run under
+   * Node's strip-only TypeScript support (parameter properties are the one
+   * syntax it rejects). `library.ts` states the same convention.
+   */
+  private readonly deps: PlayRuntimeDeps
+
+  constructor(deps: PlayRuntimeDeps) {
+    this.deps = deps
+  }
 
   /**
    * Dispose every live agent, awaiting each one.
@@ -283,9 +369,9 @@ export class TavernSessionRuntime {
     // legacy play predating the tavern preset has none recorded and resumes
     // bare, as before); a fresh session composes the tavern preset.
     await this.deps.ensurePreset()
-    const persistedPreset = await this.persistedPreset(sessionId)
+    const persisted = await this.persistedSession(sessionId)
     const setup = this.sessionSetup(
-      persistedPreset ?? TAVERN_PRESET_ID,
+      persisted.preset ?? TAVERN_PRESET_ID,
       directorSystem,
       loreContext,
       play.multiAgent ? this.speakToolDefinition() : undefined,
@@ -297,7 +383,7 @@ export class TavernSessionRuntime {
       ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),
     }
     let handle: AgentHandle
-    if (persistedPreset !== undefined) {
+    if (persisted.exists) {
       try {
         handle = await this.deps.agents.resume({
           resumeSessionId: sessionId,
@@ -309,7 +395,7 @@ export class TavernSessionRuntime {
         handle = await this.deps.agents.create({
           sessionId,
           agentOptions,
-          meta: { agentPreset: persistedPreset },
+          meta: { agentPreset: persisted.preset },
           setup,
           ...(play.greeting !== undefined && play.greeting !== ''
             ? { seed: greetingSeed(play.greeting, model.provider ?? 'default', model.model ?? 'default') }
@@ -353,17 +439,49 @@ export class TavernSessionRuntime {
   }
 
   /**
-   * Probe the persisted session for the preset it was produced under.
+   * Whether a session is already stored, and which preset it was produced under.
+   *
+   * This is deliberately NOT `preset | undefined` (see
+   * {@link PersistedSessionState}): "no session yet" and "a session that
+   * records no preset" are different states, and the caller answers the first
+   * with `agents.create(...)`.
    * @param sessionId - the session to probe.
-   * @returns the recorded preset id, or undefined when the session is not
-   * persisted (a fresh play) or has none recorded (legacy).
+   * @returns existence plus the recorded preset id.
    */
-  private async persistedPreset(sessionId: SessionId): Promise<string | undefined> {
+  private async persistedSession(sessionId: SessionId): Promise<PersistedSessionState> {
+    let handle
     try {
-      const inspected = await this.deps.sessionPersistence.inspect(sessionId)
-      return this.recordedPreset(inspected.meta, inspected.events)
-    } catch {
-      return undefined
+      // `SessionPersistence.inspect()` was removed in 0.2: a stored session is
+      // addressed through a per-session handle, and a read handle never takes
+      // ownership, so it works while the host holds this session for write.
+      handle = await this.deps.sessionPersistence.open(sessionId, 'read')
+    } catch (error: unknown) {
+      // Only "not found" means "this play has never run". Anything else
+      // (unreadable format, corruption, a backend problem) still describes a
+      // session that exists on disk, so the caller must attempt a resume
+      // rather than a create.
+      if ((error as Error | undefined)?.name === 'SessionPersistenceNotFoundError') {
+        return { exists: false, preset: undefined }
+      }
+      this.deps.logger.error(
+        'tavern: cannot open stored session "%s" (%s); assuming it exists',
+        String(sessionId),
+        String(error),
+      )
+      return { exists: true, preset: undefined }
+    }
+    try {
+      const { events } = await handle.read()
+      return { exists: true, preset: this.recordedPreset(handle.header, events) }
+    } catch (error: unknown) {
+      this.deps.logger.error(
+        'tavern: cannot read stored session "%s" (%s); assuming it exists',
+        String(sessionId),
+        String(error),
+      )
+      return { exists: true, preset: undefined }
+    } finally {
+      await handle.close().catch(() => {})
     }
   }
 
@@ -395,12 +513,13 @@ export class TavernSessionRuntime {
           this.deps.logger.warn(`tavern: preset "${presetId}" failed to mount (${String(error)}); session runs without it`)
         }
       }
-      // The persona slot shadows the preset's fixed persona (nearest scope
-      // wins), so the character-card composition is the single complete
-      // section and the play's prompt never collides with the preset's.
+      // The character-card composition is the session's ONE complete section,
+      // which is what folds the host persona and every preset section away
+      // (assembly rejects two complete sections, so the tavern preset's persona
+      // row is registered non-complete).
       agentCtx.systemPrompt.section({
-        name: PERSONA_SECTION,
-        order: PERSONA_ORDER,
+        name: TAVERN_SECTION,
+        order: TAVERN_ORDER,
         complete: true,
         text: system,
       })
@@ -492,17 +611,17 @@ export class TavernSessionRuntime {
         const agent = context.agent
         if (agent === undefined) return ''
         const scanText = this.recentSessionText(agent.session)
-        const depth = agent.session.events.filter(e => e.type === 'user/message').length
+        const depth = agent.session.snapshotEvents().filter(e => e.type === 'user/message').length
         // Seed from the play plus the turn count: stable across the several
         // assemblies of one turn (so tool-call steps see the same world), and
         // re-rolled per turn the way ST re-rolls per generation.
         const seed = hashSeed(`${play.id}:${depth}`)
-        const activated: ActivatedEntry[] = lorebooks.flatMap(book => activateBook(book.book, {
-          text: scanText,
-          depth,
-          seed,
-          budgetChars: this.deps.config.worldInfoBudgetChars,
-        }))
+        // One budget for the whole play: activating each book on its own handed
+        // every book the full ceiling, so N books injected up to N times it.
+        const activated: ActivatedEntry[] = activateBooks(
+          lorebooks.map(book => book.book),
+          { text: scanText, depth, seed, budgetChars: this.deps.config.worldInfoBudgetChars },
+        )
         const rendered = renderWorldInfo(activated)
         // World books are imported third-party content just like cards, and
         // this text lands in the model context unfenced otherwise.
@@ -521,7 +640,7 @@ export class TavernSessionRuntime {
   /** Recent user/assistant text of a session, newest last (world-book scan). */
   private recentSessionText(session: Session): string {
     const lines: string[] = []
-    for (const event of session.events) {
+    for (const event of session.snapshotEvents()) {
       if (event.type === 'user/message') {
         const text = event.data.content
           .filter((block): block is Extract<typeof block, { type: 'text' }> => block.type === 'text')
@@ -644,7 +763,30 @@ export class TavernSessionRuntime {
           signal.removeEventListener('abort', onAbort!)
         })
       })
-      await Promise.race([wait, timeout])
+      try {
+        await Promise.race([wait, timeout])
+      } catch (error: unknown) {
+        // Racing away the wait does NOT stop the character agent: it would keep
+        // streaming from the provider, finish its turn nobody is waiting for,
+        // and the NEXT tavern_speak for this character would queue behind that
+        // abandoned turn. Cancel the agent so the upstream request is aborted
+        // too (`cancel` takes the first cause for the activity and is a no-op
+        // once the agent is idle).
+        //
+        // The cause is `hook`, not `user`: it lands in the durable `turn/end`,
+        // and "the user pressed stop" would be a lie about who cancelled. The
+        // inbox is kept because the cancellation is about this one call, not
+        // about discarding work the director queued for the character.
+        try {
+          handle.agent.cancel(
+            { kind: 'hook', reason: 'tavern_speak cancelled or timed out' },
+            { keepInbox: true },
+          )
+        } catch {
+          // Already disposed: the failure below is the one worth reporting.
+        }
+        throw error
+      }
       const reply = lastAssistantText(handle.agent.session)
       if (reply.trim() === '') {
         throw new Error(`${target.card.data.name} 没有产出回复`)
@@ -704,8 +846,8 @@ export class TavernSessionRuntime {
     // preset (legacy role sessions resume bare), fresh sessions compose the
     // tavern preset.
     await this.deps.ensurePreset()
-    const persistedPreset = await this.persistedPreset(sessionId)
-    const setup = this.sessionSetup(persistedPreset ?? TAVERN_PRESET_ID, system, loreContext)
+    const persisted = await this.persistedSession(sessionId)
+    const setup = this.sessionSetup(persisted.preset ?? TAVERN_PRESET_ID, system, loreContext)
 
     const agentOptions = {
       ...(model.provider === undefined ? {} : { provider: model.provider }),
@@ -713,7 +855,7 @@ export class TavernSessionRuntime {
       ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),
     }
     let handle: AgentHandle
-    if (persistedPreset !== undefined) {
+    if (persisted.exists) {
       try {
         handle = await this.deps.agents.resume({
           resumeSessionId: sessionId,
@@ -725,7 +867,7 @@ export class TavernSessionRuntime {
         handle = await this.deps.agents.create({
           sessionId,
           agentOptions,
-          meta: { agentPreset: persistedPreset },
+          meta: { agentPreset: persisted.preset },
           setup,
         })
       }
@@ -774,11 +916,17 @@ export class TavernSessionRuntime {
       if (handle.agent.status !== 'idle') {
         throw conflict('角色正在输出中，请先停止或等待其完成')
       }
-      return [...handle.agent.session.events]
+      return [...handle.agent.session.snapshotEvents()]
     }
     try {
-      const inspected = await this.deps.sessionPersistence.inspect(play.sessionId as SessionId)
-      return [...inspected.events]
+      // A stored session is read through a handle in 0.2; `inspect()` is gone.
+      const stored = await this.deps.sessionPersistence.open(play.sessionId as SessionId, 'read')
+      try {
+        const { events } = await stored.read()
+        return [...events]
+      } finally {
+        await stored.close().catch(() => {})
+      }
     } catch (error: unknown) {
       // A play whose session was never persisted (created but never spoken to)
       // has nothing to inspect. That is a caller-visible state, not a server
@@ -960,7 +1108,7 @@ export class TavernSessionRuntime {
     // rebases the play and replaces the live director, so re-reading
     // `this.directors.get(playId)` at settle time would record a foreign
     // session's events into this branch's slot.
-    const readTail = (): SessionEvent[] => [...handle.agent.session.events].slice(prefixLength)
+    const readTail = (): SessionEvent[] => [...handle.agent.session.snapshotEvents()].slice(prefixLength)
     const done = handle.agent.whenIdle()
     try {
       handle.agent.followup(userMessage(branch.userText))

@@ -19,14 +19,7 @@
        `setTimeout` as `NodeJS.Timeout`. */
     "types": [],
     "isolatedModules": true,
-    "forceConsistentCasingInFileNames": true,
-    "paths": {
-      /* Not shipped inside the globally installed @deepseek-ai/dsh tree;
-         type-only import, resolved against the reference checkout. */
-      "@deepseek-ai/dsh-client-ui-slots": [
-        "./.ref/dsh/packages/client/ui-slots/src/index.ts"
-      ]
-    }
+    "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/client", "src/types.ts", "src/css-modules.d.ts"]
+  "include": ["src/client", "src/types.ts", "src/css-modules.d.ts", "src/client/vendor.d.ts"]
 }

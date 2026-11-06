@@ -22,15 +22,21 @@
  * whole load: one corrupt card must not cost the user their library.
  */
 
-import { randomUUID } from 'node:crypto'
-import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
+import { writeAtomic } from './atomic.ts'
 import type { CharacterRecord, Play, Preset, SwipeBranch, WorldBookRecord } from './types.ts'
 
 /** Minimal logger surface (matches the host's LoggerService shape we use). */
 export interface LibraryLogger {
   warn: (message: string) => void
   info: (message: string) => void
+  /**
+   * Failures the user has to see. The host logger has this method at the same
+   * call shape; test doubles may omit it, which is why {@link LibraryStore}
+   * falls back to `warn` when it is absent.
+   */
+  error?: (message: string) => void
 }
 
 /** The record collections held on disk, each in its own subdirectory. */
@@ -53,18 +59,6 @@ function isSafeId(id: string): boolean {
 /** File-name key of one swipe branch (branches are keyed by play + fork point). */
 function branchKey(playId: string, key: string): string {
   return `${playId}~${key}`
-}
-
-/** Write one file so readers only ever see complete content. */
-async function writeAtomic(path: string, text: string): Promise<void> {
-  const temp = `${path}.${randomUUID().slice(0, 8)}.tmp`
-  try {
-    await writeFile(temp, text, 'utf8')
-    await rename(temp, path)
-  } catch (error: unknown) {
-    await rm(temp, { force: true }).catch(() => {})
-    throw error
-  }
 }
 
 /**
@@ -101,8 +95,19 @@ export class LibraryStore {
   /** Create the library directories and read every record into the index. */
   async load(): Promise<void> {
     for (const collection of COLLECTIONS) {
-      await mkdir(join(this.root, collection), { recursive: true })
-      await this.loadCollection(collection)
+      // One unusable collection (a permission problem, a file where the
+      // directory should be, a read-only volume) must not take the whole
+      // library with it: this method is the plugin's readiness gate, so a
+      // throw here leaves the tavern permanently unstartable — and the next
+      // boot fails at the same point, with no way out from the UI.
+      try {
+        await mkdir(join(this.root, collection), { recursive: true })
+        await this.loadCollection(collection)
+      } catch (error: unknown) {
+        const message = `tavern library: cannot open collection "${collection}" under ${this.root}: ${String(error)}`
+        if (this.logger.error !== undefined) this.logger.error(message)
+        else this.logger.warn(message)
+      }
     }
   }
 
@@ -154,10 +159,15 @@ export class LibraryStore {
   /** Remove one record from disk and the index. Missing files are fine. */
   private async drop(collection: Collection, key: string): Promise<void> {
     if (!isSafeId(key)) return
+    try {
+      // File first, index second. The old order deleted the index entry and
+      // then swallowed a failed `rm`, so a record the UI reported as deleted
+      // reappeared on the next start — worse than refusing the delete.
+      await rm(join(this.root, collection, `${key}.json`), { force: true })
+    } catch (error: unknown) {
+      throw new Error(`tavern library: cannot delete ${collection}/${key}: ${String(error)}`)
+    }
     this.maps[collection].delete(key)
-    await rm(join(this.root, collection, `${key}.json`), { force: true }).catch((error: unknown) => {
-      this.logger.warn(`tavern library: cannot delete ${collection}/${key}: ${String(error)}`)
-    })
   }
 
   private all<T>(collection: Collection): T[] {
@@ -327,20 +337,35 @@ export async function migrateLegacyLibrary(
 
   logger.info(`tavern library: migrating ${total} record(s) out of the settings document`)
   let failures = 0
-  const store1 = async (label: string, write: () => Promise<void>): Promise<void> => {
+  /**
+   * Run one record's write, reporting the failure instead of propagating it.
+   * `label` is a thunk so a MALFORMED record (a `null` entry, a missing id —
+   * exactly what a hand-edited settings document contains) fails inside this
+   * guard rather than while building the message for it.
+   */
+  const store1 = async (label: () => string, write: () => Promise<void>): Promise<void> => {
+    let name = '(unidentified record)'
     try {
+      name = label()
       await write()
     } catch (error: unknown) {
       failures += 1
-      logger.warn(`tavern library: migration failed for ${label}: ${String(error)}`)
+      logger.warn(`tavern library: migration failed for ${name}: ${String(error)}`)
     }
   }
 
-  for (const record of characters) await store1(`character ${record.id}`, () => store.putCharacter(record))
-  for (const record of lorebooks) await store1(`lorebook ${record.id}`, () => store.putLorebook(record))
-  for (const record of presets) await store1(`preset ${record.id}`, () => store.putPreset(record))
-  for (const record of plays) await store1(`play ${record.id}`, () => store.putPlay(record))
-  for (const record of branches) await store1(`branch ${record.playId}/${record.key}`, () => store.putBranch(record))
+  for (const record of characters) {
+    await store1(() => `character ${String(record?.id)}`, () => store.putCharacter(record))
+  }
+  for (const record of lorebooks) await store1(() => `lorebook ${String(record?.id)}`, () => store.putLorebook(record))
+  for (const record of presets) await store1(() => `preset ${String(record?.id)}`, () => store.putPreset(record))
+  for (const record of plays) await store1(() => `play ${String(record?.id)}`, () => store.putPlay(record))
+  for (const record of branches) {
+    await store1(
+      () => `branch ${String(record?.playId)}/${String(record?.key)}`,
+      () => store.putBranch(record),
+    )
+  }
 
   if (failures > 0) {
     // Leave the settings copy alone: it is now the only complete copy.

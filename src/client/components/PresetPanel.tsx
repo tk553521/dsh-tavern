@@ -119,6 +119,10 @@ export function PresetPanel(props: PresetPanelProps) {
           </div>
         ) : (
           <PresetEditor
+            // The editor seeds every field from the preset props; without a key
+            // a selection switch would keep editing the previous preset and
+            // save it over the newly selected one.
+            key={selected.id}
             api={props.api}
             preset={selected}
             isDefault={selected.id === props.defaultPresetId}

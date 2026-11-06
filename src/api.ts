@@ -9,11 +9,11 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { LoggerService } from '@deepseek-ai/cordis'
 import type { CharacterRecord, Play, Preset, SwipeBranchSummary, WorldBookRecord } from './types.ts'
 import { TavernStorage, newId, nowIso } from './storage.ts'
-import { normalizeCard, parseCardInput, avatarDataUrl, normalizeWorldBook, serializeWorldBookFile, importPreset, serializePreset } from './cardcodec.ts'
+import { normalizeCard, parseCardInput, avatarDataUrl, normalizeWorldBook, serializeWorldBookFile, importPreset, serializePreset, serializeCharacterCard } from './cardcodec.ts'
 import { encodePngCardResult } from './png.ts'
 import { playLorebookIds, TavernSessionRuntime } from './play.ts'
 import { importTauriTavernData } from './tauritavern.ts'
-import { TavernUserError } from './errors.ts'
+import { badRequest, TavernUserError } from './errors.ts'
 import type { TavernConfig } from './config.ts'
 import type { AvatarStore } from './avatarstore.ts'
 
@@ -26,6 +26,18 @@ export interface TavernApiDeps {
   config: TavernConfig
   /** Whether the agent-loop factory is currently available (session assembly). */
   multiAgentAvailable: () => boolean
+  /**
+   * The host's own admission check for one raw request, when the profile has a
+   * connection service.
+   *
+   * `ctx.webServer.register` is a bare `node:http` listener: the host's
+   * browser-credential and Host/Origin fence lives in `ctx.connection`, and
+   * nothing applies it to a plugin route. Without this probe `/tavern` is an
+   * unauthenticated local API — any process on the machine could read the whole
+   * card library, delete records, or use the importer as a directory oracle.
+   * @returns 401/403 to refuse, or undefined to continue.
+   */
+  authorize?: (req: IncomingMessage) => 401 | 403 | undefined
 }
 
 /** Read and JSON-parse a request body (bounded). */
@@ -36,7 +48,9 @@ function readJsonBody(req: IncomingMessage, limit = 16 * 1024 * 1024): Promise<u
     req.on('data', (chunk: Buffer) => {
       total += chunk.length
       if (total > limit) {
-        reject(new Error('请求体过大'))
+        // A plain `Error` here used to surface as `500 服务器内部错误`; an
+        // oversized body is the caller's problem and must say so.
+        reject(new TavernUserError(`请求体超过上限（${Math.floor(limit / 1024 / 1024)} MiB）`, 413))
         req.destroy()
         return
       }
@@ -86,10 +100,15 @@ function segments(pathname: string): string[] {
  * Comparing `Origin` against `Host` alone does not stop DNS rebinding: the
  * attacker points `evil.example` at 127.0.0.1, and the browser then sends
  * `Origin: http://evil.example` with `Host: evil.example` — a perfect match,
- * from a page the attacker controls. An IP literal cannot be rebound this way
- * (the browser sends the literal the user actually typed), and neither can
- * `localhost`, so those are the safe set. A deployment reached through a real
- * hostname opts that name in through the plugin config's `allowedHosts`.
+ * from a page the attacker controls. A loopback IP literal cannot be rebound
+ * this way (the browser sends the literal the user actually typed), and neither
+ * can `localhost`, so those are the safe set. A deployment reached through a
+ * real hostname opts that name in through the plugin config's `allowedHosts`.
+ *
+ * This is a defence against a BROWSER on this machine; it is not
+ * authentication. Every request is admitted by the host's own credential fence
+ * first (see `TavernApiDeps.authorize`), which is what covers non-browser
+ * clients.
  * @param hostHeader - the request's Host header.
  * @param allowed - extra host names from the plugin config, already lowercased.
  */
@@ -101,10 +120,20 @@ function hostAllowsMutation(hostHeader: string | undefined, allowed: readonly st
     ? value.slice(1, value.indexOf(']') === -1 ? undefined : value.indexOf(']'))
     : value.replace(/:\d+$/, '')
   if (host === 'localhost' || host.endsWith('.localhost')) return true
-  // IPv4 / IPv6 literals.
-  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return true
-  if (host.includes(':')) return true
-  return allowed.includes(host)
+  // Only the LOOPBACK ranges are inherently safe. Treating every IPv4 literal
+  // as safe accepted `Host: 8.8.8.8` (a page can reach this server through any
+  // address it is bound to), and treating every IPv6 literal as safe accepted
+  // everything with a colon.
+  if (/^127(?:\.\d{1,3}){3}$/.test(host)) return true
+  if (host === '::1' || host === '0:0:0:0:0:0:0:1') return true
+  // A configured name may carry a port (`tavern.example:8443`); compare hosts,
+  // not authorities, so both spellings match.
+  return allowed.some((entry) => {
+    const name = entry.startsWith('[')
+      ? entry.slice(1, entry.indexOf(']') === -1 ? undefined : entry.indexOf(']'))
+      : entry.replace(/:\d+$/, '')
+    return name === host
+  })
 }
 
 export interface PlayCreateInput {
@@ -172,6 +201,26 @@ function patchPreset(existing: Preset, body: Record<string, unknown>): Preset {
   return updated
 }
 
+/**
+ * Run one decoder and map its failure onto a caller-visible 400.
+ *
+ * The card / world-book / preset decoders throw plain `Error`s for ordinary
+ * input problems ("缺少字段 name", "entries 不是对象"). Letting those reach the
+ * catch-all turned every malformed body into `500 服务器内部错误`, which tells
+ * the user nothing and looks like a server fault.
+ * @param label - what was being decoded, prefixed onto the message.
+ * @param run - the decoding call.
+ * @returns the decoded value.
+ */
+function validated<T>(label: string, run: () => T): T {
+  try {
+    return run()
+  } catch (error: unknown) {
+    if (error instanceof TavernUserError) throw error
+    throw badRequest(`${label}：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 /** The prefix-route handler for /tavern. */
 export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const { storage, runtime } = deps
@@ -179,6 +228,14 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
   const method = req.method ?? 'GET'
 
   try {
+    // Host admission first, for EVERY method: the same-origin rules below are
+    // a second fence for browser-borne writes, but they do not authenticate a
+    // non-browser client, and they do not protect reads at all.
+    const rejection = deps.authorize?.(req)
+    if (rejection !== undefined) {
+      return sendError(res, rejection, '需要 DSH 会话凭据')
+    }
+
     // Mutating endpoints are same-origin only. A cross-site page could
     // otherwise drive the local server with CORS-simple requests (e.g.
     // text/plain POST via no-cors): the response stays unread, but the
@@ -207,7 +264,13 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
       }
       // A body must be JSON; urlencoded/text/plain (the CSRF-capable types)
       // never reach a handler.
-      const hasBody = req.headers['content-length'] !== undefined
+      //
+      // `content-length: 0` is NOT a body: several clients (PowerShell's
+      // Invoke-WebRequest among them) send that header on a bodiless DELETE,
+      // and treating it as "there is a body" rejected every such delete with
+      // 415 before the route was even reached.
+      const declaredLength = Number(req.headers['content-length'] ?? 0)
+      const hasBody = (Number.isFinite(declaredLength) && declaredLength > 0)
         || req.headers['transfer-encoding'] !== undefined
       const contentType = String(req.headers['content-type'] ?? '').toLowerCase()
       if (hasBody && !contentType.includes('application/json')) {
@@ -348,7 +411,7 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
         const character = storage.getCharacter(seg[2]!)
         if (character === undefined) return sendError(res, 404, '角色不存在')
         const avatar = await deps.avatars.readCharacter(character)
-        const encoded = encodePngCardResult(JSON.stringify(character.card), avatar)
+        const encoded = encodePngCardResult(JSON.stringify(serializeCharacterCard(character.card)), avatar)
         const name = character.card.data.name.replace(/[\\/:*?"<>|]/g, '_') || 'character'
         // A jpeg/webp/gif avatar cannot be embedded in a PNG card without
         // transcoding, so the card falls back to a blank image. Say so in a
@@ -375,11 +438,11 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
         let name = typeof body.name === 'string' && body.name !== '' ? body.name : '未命名世界书'
         const bookObj = body.book
         if (typeof bookObj === 'object' && bookObj !== null) {
-          book = normalizeWorldBook(bookObj)
+          book = validated('世界书', () => normalizeWorldBook(bookObj))
           const bookName = (bookObj as Record<string, unknown>).name
           if (typeof bookName === 'string' && bookName !== '') name = bookName
         } else if (typeof body.input === 'string') {
-          book = normalizeWorldBook(JSON.parse(body.input))
+          book = validated('世界书', () => normalizeWorldBook(JSON.parse(body.input as string)))
         } else {
           return sendError(res, 400, '缺少世界书内容')
         }
@@ -400,7 +463,7 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
         if (typeof body?.book !== 'object' || body.book === null) {
           return sendError(res, 400, '缺少世界书内容')
         }
-        const book = normalizeWorldBook(body.book)
+        const book = validated('世界书', () => normalizeWorldBook(body.book))
         const updated: WorldBookRecord = {
           ...existing,
           name: typeof body?.name === 'string' && body.name !== '' ? body.name : existing.name,

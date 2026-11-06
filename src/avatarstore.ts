@@ -6,16 +6,14 @@
  * is created/updated/imported.
  */
 
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm } from 'node:fs/promises'
 import path from 'node:path'
 import type { LoggerService } from '@deepseek-ai/cordis'
 import type { CharacterRecord } from './types.ts'
+import { writeAtomic } from './atomic.ts'
 
 /** Directory prefix persisted in `character.avatar` (portable, `/`-separated). */
 export const AVATAR_DIR_RELATIVE = 'tavern/avatars'
-
-/** Every extension this store may write for one character id. */
-const AVATAR_EXTENSIONS = ['png', 'jpg', 'jpeg', 'webp', 'gif'] as const
 
 const SAFE_FILE_RE = /^[a-zA-Z0-9_-]+\.(?:png|jpg|jpeg|webp|gif)$/i
 const DATA_URL_RE = /^data:(image\/(?:png|jpeg|jpg|webp|gif));base64,([A-Za-z0-9+/=\r\n]+)$/i
@@ -77,18 +75,33 @@ function fileFromAvatar(avatar: string | undefined): string | undefined {
   return SAFE_FILE_RE.test(file) ? file : undefined
 }
 
+/** Options for {@link AvatarStore.materializeCharacter}. */
+export interface MaterializeAvatarOptions {
+  /**
+   * Keep an unsupported, oversized, or undecodable inline avatar on the record
+   * instead of dropping it.  Dropping is right for an incoming HTTP payload
+   * (the settings document must stay bounded), but wrong for a startup
+   * migration: the inline value may be the user's only copy and the migration
+   * result is persisted immediately.
+   */
+  keepUnsupported?: boolean
+}
+
 /**
  * File-backed avatar store.  Persisted paths are always relative to the DSH
  * home directory so the settings document stays host-independent.
  */
 export class AvatarStore {
+  /** Per-character write tail, so concurrent saves cannot interleave disk work. */
+  private readonly tails = new Map<string, Promise<unknown>>()
+
   constructor(
     readonly root: string,
     /**
      * The plugin logger.  Public because the TauriTavern importer runs as plain
      * functions with no logger of their own and already receives this store.
      */
-    readonly logger: Pick<LoggerService, 'warn'>,
+    readonly logger: Pick<LoggerService, 'warn' | 'error'>,
   ) {}
 
   private filePath(file: string): string {
@@ -99,28 +112,55 @@ export class AvatarStore {
     await mkdir(this.root, { recursive: true })
   }
 
+  /** Run `task` after every previous task for the same character has settled. */
+  private async serialize<T>(id: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.tails.get(id) ?? Promise.resolve()
+    const run = previous.then(() => undefined, () => undefined).then(task)
+    const settled = run.then(() => undefined, () => undefined)
+    this.tails.set(id, settled)
+    void settled.then(() => {
+      // Only the last writer in the chain clears the entry.
+      if (this.tails.get(id) === settled) this.tails.delete(id)
+    })
+    return run
+  }
+
   /**
    * Replace a character's data-URL avatar with an on-disk file and return the
    * record that should be persisted.  Records that already use a relative path
    * (or have no avatar) are returned unchanged.  A value this store could never
-   * have produced is dropped rather than written back: the HTTP body cap is the
-   * only limit on what a client can put in `avatar`, and whatever lands in the
+   * have produced is dropped rather than written back (unless the caller opts
+   * into `keepUnsupported` for a migration): the HTTP body cap is the only
+   * limit on what a client can put in `avatar`, and whatever lands in the
    * settings document is re-serialized on every later library mutation.
+   *
+   * Writes are serialized per character and go through {@link writeAtomic}, so
+   * two saves of the same record (two tabs, double click, import-then-edit)
+   * cannot overwrite each other half-way or delete each other's file.
    */
   async materializeCharacter(
     record: CharacterRecord,
     previous?: CharacterRecord,
+    options: MaterializeAvatarOptions = {},
   ): Promise<CharacterRecord> {
     const avatar = record.avatar
     if (avatar === undefined) return record
     if (!avatar.startsWith('data:')) {
       if (fileFromAvatar(avatar) !== undefined) return record
+      if (options.keepUnsupported === true) {
+        this.logger.error('tavern avatar: cannot migrate unrecognized avatar for character %s; keeping it unchanged', record.id)
+        return record
+      }
       this.logger.warn('tavern avatar: dropping unrecognized avatar value for character %s', record.id)
       return withoutAvatar(record)
     }
 
     const decoded = decodeDataUrl(avatar)
     if (decoded === undefined) {
+      if (options.keepUnsupported === true) {
+        this.logger.error('tavern avatar: cannot migrate unsupported or oversized avatar for character %s; keeping the inline value', record.id)
+        return record
+      }
       this.logger.warn('tavern avatar: dropping unsupported or oversized avatar for character %s', record.id)
       return withoutAvatar(record)
     }
@@ -131,29 +171,33 @@ export class AvatarStore {
       return record
     }
 
-    await this.ensureRoot()
-    await writeFile(this.filePath(file), decoded.bytes)
-    await this.removeStale(record.id, file, previous)
-
-    return { ...record, avatar: relativeAvatar(file) }
+    return this.serialize(record.id, async () => {
+      await this.ensureRoot()
+      // The image bytes go through the same per-path writer as the JSON
+      // records: that is what serializes concurrent writers and retries the
+      // Windows EPERM case. `writeAtomic` accepts raw bytes, so nothing is
+      // re-encoded on the way (any string round trip would corrupt every byte
+      // above 0x7f).
+      await writeAtomic(this.filePath(file), decoded.bytes)
+      await this.removePrevious(file, previous)
+      return { ...record, avatar: relativeAvatar(file) }
+    })
   }
 
   /**
-   * Drop leftovers for the same character once the replacement is durable.  The
-   * id alone defines the candidate names because the bulk import path has no
-   * `previous` record to compare against, so a changed image extension would
-   * otherwise strand the old file forever.
+   * Delete the file the record pointed at before the new one became durable.
+   *
+   * Only that exact file is removed.  The old code swept every known extension
+   * for the id, which deleted the copy a concurrent save had just written —
+   * two tabs saving the same character as png and jpg left both records
+   * pointing at a 404.  An orphaned file from a changed extension is left
+   * behind on purpose: a stray byte costs nothing, a missing avatar does not
+   * come back.
    */
-  private async removeStale(id: string, current: string, previous?: CharacterRecord): Promise<void> {
-    const names = new Set(AVATAR_EXTENSIONS
-      .map(extension => safeFile(id, extension))
-      .filter((name): name is string => name !== undefined))
+  private async removePrevious(current: string, previous?: CharacterRecord): Promise<void> {
     const previousFile = previous !== undefined ? fileFromAvatar(previous.avatar) : undefined
-    if (previousFile !== undefined) names.add(previousFile)
-    for (const name of names) {
-      if (name.toLowerCase() === current.toLowerCase()) continue
-      await rm(this.filePath(name), { force: true }).catch(() => void 0)
-    }
+    if (previousFile === undefined || previousFile.toLowerCase() === current.toLowerCase()) return
+    await rm(this.filePath(previousFile), { force: true }).catch(() => void 0)
   }
 
   /**
@@ -173,23 +217,37 @@ export class AvatarStore {
   }
 
   /**
-   * Migrate legacy inline avatars out of the settings document.  A failed file
-   * write keeps the original data URL, so a migration is always safe to retry.
+   * Migrate legacy inline avatars out of the settings document.
+   *
+   * A migration is a data move, never a cleanup: if the value cannot be
+   * decoded or written, the original record is returned untouched and the
+   * inline avatar stays in the library.  The previous behaviour dropped an
+   * oversized or non-whitelisted avatar and then persisted the loss, which
+   * destroyed the only copy on the first startup after upgrading.
+   * @returns the records to persist, how many gained a file, and how many kept
+   * their inline value for a later run.
    */
-  async migrateLegacyCharacters(records: CharacterRecord[]): Promise<{ characters: CharacterRecord[]; changed: number }> {
+  async migrateLegacyCharacters(
+    records: CharacterRecord[],
+  ): Promise<{ characters: CharacterRecord[]; changed: number; skipped: number }> {
     const characters: CharacterRecord[] = []
     let changed = 0
+    let skipped = 0
     for (const record of records) {
       try {
-        const next = await this.materializeCharacter(record, record)
+        const next = await this.materializeCharacter(record, record, { keepUnsupported: true })
         if (next.avatar !== record.avatar) changed += 1
+        else if (record.avatar !== undefined && fileFromAvatar(record.avatar) === undefined) skipped += 1
         characters.push(next)
       } catch (error) {
-        this.logger.warn('tavern avatar: failed to migrate avatar for %s: %s', record.id, String(error))
+        // A write error must also keep the original value: the inline data URL
+        // is still the only copy, and the next startup can retry.
+        this.logger.error('tavern avatar: failed to migrate avatar for %s: %s', record.id, String(error))
+        skipped += 1
         characters.push(record)
       }
     }
-    return { characters, changed }
+    return { characters, changed, skipped }
   }
 
   /** Read a stored avatar for the HTTP route. */

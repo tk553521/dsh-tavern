@@ -3,9 +3,10 @@
  *
  * The library (characters, world books, presets, plays, swipe branches) lives
  * as per-record JSON files under `$DSH_HOME/tavern/library/` — see
- * {@link LibraryStore} for why it is not in the settings document any more.
- * Only small preferences (`defaultPresetId`, `style`) remain on the settings
- * service, which is what that service is for.
+ * {@link LibraryStore} for why it is not in one settings document any more.
+ * Small preferences (`defaultPresetId`, `style`) live beside it in
+ * `$DSH_HOME/tavern/prefs.json` — see {@link PrefsScope} for why they are not
+ * on `ctx.settings` any more.
  *
  * This class keeps the same surface it had when it was settings-backed, so
  * every caller is unchanged: synchronous reads against an in-memory index,
@@ -13,17 +14,17 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import type { SettingsScope } from '@deepseek-ai/dsh-settings'
 import type {
   CharacterRecord, Play, Preset, SwipeBranch, TavernStyle, WorldBookRecord,
 } from './types.ts'
 import type { LibraryStore } from './library.ts'
+import type { PrefsScope } from './prefs.ts'
 
 /**
- * The persisted settings section. The library arrays are still declared so a
- * pre-migration document validates and can be read once, but nothing writes
- * them any more — {@link migrateLegacyLibrary} moves them onto disk and the
- * plugin then clears them.
+ * The persisted database shape callers see from {@link TavernStorage.snapshot}
+ * and read back at migration time. The library arrays are no longer stored in
+ * one document; they are declared here because the snapshot is assembled into
+ * this shape and a legacy import may still supply it.
  */
 export interface TavernDatabase {
   version: 1
@@ -69,9 +70,9 @@ export function nowIso(): string {
 /** Storage facade over the library file store plus the preferences section. */
 export class TavernStorage {
   private readonly library: LibraryStore
-  private readonly prefs: SettingsScope<TavernDatabase>
+  private readonly prefs: PrefsScope
 
-  constructor(library: LibraryStore, prefs: SettingsScope<TavernDatabase>) {
+  constructor(library: LibraryStore, prefs: PrefsScope) {
     this.library = library
     this.prefs = prefs
   }
@@ -247,9 +248,9 @@ export class TavernStorage {
 
   async setDefaultPreset(id: string | undefined): Promise<void> {
     if (id === undefined) {
-      // A patch cannot express key removal — the settings service strips
-      // `undefined` from patches so a sparse patch cannot erase lower keys —
-      // so the section is replaced instead.
+      // A sparse patch cannot express key removal (an `undefined` value is
+      // dropped, exactly as a settings patch did), so the document is
+      // replaced instead.
       const section = this.prefs.get()
       const next: TavernDatabase = { ...emptyDatabase(), ...section }
       delete next.defaultPresetId

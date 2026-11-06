@@ -9,7 +9,10 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { ConvViewProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
-import type { ConversationSnapshot, SessionFace } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ObservableSnapshot } from '@deepseek-ai/dsh-client-store'
+import type { SessionFace, SessionSnapshot } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { ChatSnapshot } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { IConversation } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { PlaySummary, SwipeBranchSummary, TavernState, TavernStyle } from '../types.ts'
 import { tavernApi, type TavernApi } from './api.ts'
@@ -22,15 +25,38 @@ import { TauriTavernImportPanel } from './components/TauriTavernImportPanel.tsx'
 import { Empty } from './components/common.tsx'
 import css from './TavernView.module.css'
 
-/** The concrete session methods needed to load a non-current play session. */
-export type OpenableSession = SessionFace & { open(): Promise<void> }
+/**
+ * One play session retained by the tavern view, with the live sources the
+ * transcript and the composer read.
+ *
+ * The tavern shows a session that is not the shell's current one (a play may
+ * be an archived session), so the view owns a Client reference to it for as
+ * long as it displays it. Borrowing instead (`sessions.binding`/`scope`) only
+ * resolves a generation somebody else retains and returns `undefined` for
+ * every other session — which is exactly the case this view exists for.
+ */
+export interface TavernSessionHandle {
+  /** Retained session face: identity plus lifecycle state (`running`, open state). */
+  readonly session: SessionFace
+  /** Scope-addressed conversation face used to send into and cancel this play. */
+  readonly conversation: IConversation
+  /**
+   * Chat target of this session's Conversation assembly. Resolves to
+   * `undefined` until a Chat view builder has produced a snapshot for the
+   * session; subscribing is also what activates the target for a session the
+   * Chat tab is not currently rendering.
+   */
+  readonly chat: ObservableSnapshot<ChatSnapshot | undefined>
+  /** Settles when the shared initial open of this session succeeds or fails. */
+  readonly ready: Promise<unknown>
+  /** Drop this view's retained reference; safe to call once per handle. */
+  release(): void
+}
 
 /** Business callbacks injected into the tavern view (session-scoped). */
 export interface TavernViewInjected {
-  /** Resolve a play session's live snapshot source without changing the global current session. */
-  getSession: (sessionId: string) => OpenableSession | undefined
-  /** Resolve a play session's conversation service for sending. */
-  getConversation: (sessionId: string) => IConversation
+  /** Retain a play session and resolve its view sources without switching the global current session. */
+  retainSession: (sessionId: string) => TavernSessionHandle
 }
 
 /** Full props: framework runtime share + store share + inject face. */
@@ -135,18 +161,18 @@ function splitSpeakerRuns(text: string, characterNames: readonly string[]): Spea
 }
 
 /**
- * Project ordered user/assistant rows from the session snapshot, attaching
- * per-row generation status (streaming / stopped / truncated / error) and
- * thinking text from the chat node's turn metadata.
+ * Project ordered user/assistant rows from the session's Chat target snapshot,
+ * attaching per-row generation status (streaming / stopped / truncated / error)
+ * and thinking text from the chat node's turn metadata.
  */
 export function extractMessages(
-  snapshot: ConversationSnapshot,
+  snapshot: ChatSnapshot,
   characterNames: readonly string[],
 ): ViewMessage[] {
   // First pass: collect turn-level end markers (max-token truncation / error).
   const turnMarks = new Map<number, { truncated?: true; error?: string }>()
-  for (const key of snapshot.chat.order) {
-    const node = snapshot.chat.nodes.get(key)
+  for (const key of snapshot.order) {
+    const node = snapshot.nodes.get(key)
     if (node === undefined) continue
     const data = node.data as { turn?: number; message?: string }
     if (node.kind === 'turn-max-tokens' && typeof data.turn === 'number') {
@@ -158,8 +184,8 @@ export function extractMessages(
   }
 
   const out: ViewMessage[] = []
-  for (const key of snapshot.chat.order) {
-    const node = snapshot.chat.nodes.get(key)
+  for (const key of snapshot.order) {
+    const node = snapshot.nodes.get(key)
     if (node === undefined) continue
     if (node.kind === 'user' || node.kind === 'steering') {
       const data = node.data as { content?: readonly { type: string; text?: string }[] }
@@ -221,8 +247,8 @@ async function loadState(api: TavernApi): Promise<TavernState> {
   return api.state()
 }
 
-/** Subscribe to an arbitrary session snapshot without making it the global current session. */
-function useSessionSnapshot(session: OpenableSession | undefined): ConversationSnapshot | undefined {
+/** Subscribe to a retained session's lifecycle snapshot. */
+function useSessionSnapshot(session: SessionFace | undefined): SessionSnapshot | undefined {
   return useSyncExternalStore(
     useCallback(
       (onStoreChange: () => void) => session?.subscribe(onStoreChange) ?? (() => {}),
@@ -232,12 +258,22 @@ function useSessionSnapshot(session: OpenableSession | undefined): ConversationS
   )
 }
 
+/** Subscribe to a retained session's Chat target snapshot. */
+function useChatSnapshot(source: ObservableSnapshot<ChatSnapshot | undefined> | undefined): ChatSnapshot | undefined {
+  return useSyncExternalStore(
+    useCallback(
+      (onStoreChange: () => void) => source?.subscribe(onStoreChange) ?? (() => {}),
+      [source],
+    ),
+    useCallback(() => source?.getSnapshot(), [source]),
+  )
+}
+
 export function TavernView({
   useStore,
   actions,
   useSessions,
-  getSession,
-  getConversation,
+  retainSession,
 }: TavernViewProps) {
   const panel = useStore(s => s.panel)
   const playId = useStore(s => s.playId)
@@ -251,11 +287,6 @@ export function TavernView({
   const rootRef = useRef<HTMLDivElement | null>(null)
   // Style preference: optimistic local state, seeded from the server snapshot.
   const [style, setStyle] = useState<TavernStyle>('dsh')
-
-  // The current DSH session this view is bound to (session scope).
-  const currentSessionId = useSessions(s => s.current)
-  // Re-resolve the active play session when the session list changes.
-  const sessionIds = useSessions(s => s.ids)
 
   const refresh = useCallback(async (): Promise<void> => {
     const next = await loadState(tavernApi)
@@ -331,23 +362,58 @@ export function TavernView({
   )
 
   const activePlay = playId !== null ? state?.plays.find(p => p.id === playId) ?? null : null
-  const activeSession = useMemo(
-    () => activePlay === null ? undefined : getSession(activePlay.sessionId),
-    [activePlay, getSession, sessionIds],
+  const playSessionId = activePlay?.sessionId
+  // Retain only an id the session list already knows: `sessions.retain` throws
+  // for an uncatalogued id (a play whose activate/create round-trip is still in
+  // flight), and the list arriving later re-runs the effect below.
+  const playSessionKnown = useSessions(
+    s => playSessionId !== undefined && s.byId[playSessionId as SessionId] !== undefined,
   )
-  const activeSnapshot = useSessionSnapshot(activeSession)
-  const activeSessionId = activeSession?.sessionId
-  const displaySessionId = activeSessionId ?? currentSessionId
+  const [handle, setHandle] = useState<TavernSessionHandle | undefined>(undefined)
 
-  // Open the selected play session's history in the background. Unlike
-  // `sessions.open`, this does not change the global current session, so an
-  // archived tavern session does not kick the UI back to the workspace home.
+  // Own a reference to the displayed play session for exactly as long as this
+  // view displays it. Retaining is what starts the shared initial history open
+  // and what keeps the session's Client scope (and its Conversation assembly)
+  // alive; React releases the previous reference on switch/unmount, and the
+  // plugin's own ctx.effect releases whatever a still-mounted view holds if the
+  // whole fiber unloads first.
   useEffect(() => {
-    if (activeSession === undefined) return
-    void activeSession.open().catch(e => {
-      actions.setError(e instanceof Error ? e.message : String(e))
+    if (playSessionId === undefined || !playSessionKnown) {
+      setHandle(undefined)
+      return
+    }
+    let next: TavernSessionHandle
+    try {
+      next = retainSession(playSessionId)
+    } catch (error) {
+      // The id can disappear between the list snapshot and this commit.
+      actions.setError(error instanceof Error ? error.message : String(error))
+      setHandle(undefined)
+      return
+    }
+    setHandle(next)
+    // Surface a failed open instead of leaving an empty thread behind. A
+    // rejection caused by our own release (play switch / unmount) is not a
+    // failure and must not raise an error banner for a view nobody sees.
+    let disposed = false
+    void next.ready.catch((error: unknown) => {
+      if (disposed) return
+      actions.setError(error instanceof Error ? error.message : String(error))
     })
-  }, [activeSession, actions])
+    return () => {
+      disposed = true
+      next.release()
+    }
+  }, [playSessionId, playSessionKnown, retainSession, actions])
+
+  // Ignore a handle left over from the previous play for the commits between a
+  // play switch and the effect that retains the next session.
+  const activeHandle = handle !== undefined && handle.session.sessionId === playSessionId
+    ? handle
+    : undefined
+  const sessionSnapshot = useSessionSnapshot(activeHandle?.session)
+  const chatSnapshot = useChatSnapshot(activeHandle?.chat)
+  const displaySessionId = activeHandle?.session.sessionId
 
   // The tavern view opts into the shell's composer-overlay contract
   // (`data-conversation-composer-overlay` on the root, the same opt-in the
@@ -421,11 +487,11 @@ export function TavernView({
   }, [])
 
   const messages = useMemo(
-    () => (activeSnapshot === undefined ? [] : extractMessages(activeSnapshot, characterNames)),
-    [activeSnapshot, characterNames],
+    () => (chatSnapshot === undefined ? [] : extractMessages(chatSnapshot, characterNames)),
+    [chatSnapshot, characterNames],
   )
-  const running = (activeSnapshot?.running ?? false)
-    || (activeSnapshot !== undefined && activeSnapshot.chat.legacy.partial !== null)
+  const running = (sessionSnapshot?.running ?? false)
+    || (chatSnapshot !== undefined && chatSnapshot.legacy.partial !== null)
 
   // The latest swipe branch of the active play (its generation progress).
   const swipe = useMemo<SwipeBranchSummary | undefined>(() => {
@@ -479,11 +545,11 @@ export function TavernView({
   }, [activePlay, runBranchOp])
 
   const cancelRun = useCallback((): void => {
-    if (activeSession === undefined) return
-    getConversation(activeSession.sessionId).cancel().catch(e => {
+    if (activeHandle === undefined) return
+    activeHandle.conversation.cancel().catch(e => {
       actions.setError(e instanceof Error ? e.message : String(e))
     })
-  }, [activeSession, actions, getConversation])
+  }, [activeHandle, actions])
 
   return (
     <div ref={rootRef} className={css.view} data-style={style} data-conversation-composer-overlay="">
@@ -556,7 +622,7 @@ export function TavernView({
               activePlayTitle={activePlay?.title}
               multiAgentAvailable={state.multiAgentAvailable}
               messages={messages}
-              activeSessionId={activeSessionId}
+              activeSessionId={activeHandle?.session.sessionId}
               running={running}
               swipe={swipe}
               branching={branching}
@@ -573,10 +639,10 @@ export function TavernView({
               onSend={async (text) => {
                 actions.setError(null)
                 try {
-                  if (activePlay === null || activeSession === undefined) {
+                  if (activePlay === null || activeHandle === undefined) {
                     throw new Error('请先选择一个酒馆会话')
                   }
-                  await getConversation(activeSession.sessionId).send(text)
+                  await activeHandle.conversation.send(text)
                 } catch (e) {
                   actions.setError(e instanceof Error ? e.message : String(e))
                   // Surface *and* reject (same contract as onCreatePlay): the

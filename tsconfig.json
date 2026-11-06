@@ -26,12 +26,7 @@
     "noEmit": true,
     "types": ["node"],
     "isolatedModules": true,
-    "forceConsistentCasingInFileNames": true,
-    "paths": {
-      "@deepseek-ai/dsh-client-ui-slots": [
-        "./.ref/dsh/packages/client/ui-slots/src/index.ts"
-      ]
-    }
+    "forceConsistentCasingInFileNames": true
   },
   "include": ["src"]
 }

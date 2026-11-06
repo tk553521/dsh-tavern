@@ -117,6 +117,10 @@ export function LorebookPanel(props: LorebookPanelProps) {
           </div>
         ) : (
           <LorebookEditor
+            // The editor seeds its state from the book props; without a key a
+            // selection switch would keep editing the previous book and save
+            // it over the newly selected one.
+            key={selected.id}
             api={props.api}
             book={selected}
             onChanged={props.onChanged}

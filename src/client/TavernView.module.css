@@ -1568,6 +1568,16 @@
   color: var(--tv-text-secondary);
 }
 
+/* Expanded chain: solid frame and a lit toggle so the open state reads at a
+   glance next to the collapsed rows above it. */
+.thinkingOpen {
+  border-style: solid;
+}
+
+.thinkingOpen > .thinkingToggle {
+  color: var(--tv-text-secondary);
+}
+
 .thinkingCaret {
   color: var(--tv-accent-text);
 }

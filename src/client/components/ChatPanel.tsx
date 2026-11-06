@@ -765,6 +765,11 @@ export function ChatPanel(props: ChatPanelProps) {
                   disabled={running || !inPlaySession}
                   onChange={event => setDraft(event.target.value)}
                   onKeyDown={event => {
+                    // Enter also commits an IME candidate: a Chinese/Japanese
+                    // user pressing it to pick a character must not send the
+                    // half-composed pinyin. keyCode 229 is the legacy signal
+                    // browsers still emit for the composition keystroke.
+                    if (event.nativeEvent.isComposing || event.keyCode === 229) return
                     if (event.key === 'Enter' && !event.shiftKey) {
                       event.preventDefault()
                       send()

@@ -52,7 +52,7 @@ export function normalizeCard(raw: unknown, sourceName?: string): CharacterCard 
       ? { group_only_greetings: strArray(dataRaw.group_only_greetings) }
       : {}),
     ...(isWorldBookish(dataRaw.character_book)
-      ? { character_book: normalizeWorldBook(dataRaw.character_book) }
+      ? { character_book: normalizeCharacterBook(dataRaw.character_book) }
       : {}),
     tags: strArray(dataRaw.tags),
     creator: str(dataRaw.creator),
@@ -265,9 +265,113 @@ function resolveUids(candidates: readonly (number | undefined)[]): number[] {
 }
 
 /**
+ * A `character_book` entry.  The card schema (`keys`, `secondary_keys`,
+ * `insertion_order`, `enabled`, string `position`) and the ST world-info
+ * schema (`key`, `keysecondary`, `order`, `disable`, numeric `position`) are
+ * two different formats, not aliases; reading one with the other's field
+ * names loses every trigger and inverts `enabled`.  The canonical form stays
+ * the world-info entry, and the two card-only fields (`name`, `priority`)
+ * ride along on it so an export can write them back instead of dropping them.
+ */
+interface CharacterBookEntry extends WorldBookEntry {
+  name?: string
+  priority?: number
+}
+
+/** Whether an array entry follows the embedded `character_book` schema. */
+function isCharacterBookEntry(raw: Record<string, unknown>): boolean {
+  return 'keys' in raw || 'secondary_keys' in raw || 'insertion_order' in raw || 'enabled' in raw
+}
+
+/** Book-level fields shared by world-info files and the card `character_book`. */
+function bookMetadata(obj: Record<string, unknown>): Omit<WorldBook, 'entries'> {
+  return {
+    ...(typeof obj.name === 'string' ? { name: obj.name } : {}),
+    ...(typeof obj.description === 'string' ? { description: obj.description } : {}),
+    ...(typeof obj.scan_depth === 'number' ? { scan_depth: obj.scan_depth } : {}),
+    ...(typeof obj.token_budget === 'number' ? { token_budget: obj.token_budget } : {}),
+    ...(typeof obj.recursive_scanning === 'boolean' ? { recursive_scanning: obj.recursive_scanning } : {}),
+    ...(typeof obj.extensions === 'object' && obj.extensions !== null
+      ? { extensions: obj.extensions as Record<string, unknown> }
+      : {}),
+  }
+}
+
+/**
+ * Normalize one embedded `character_book` entry.  It starts from the
+ * world-info reader so every canonical field (content, constant, selective,
+ * extensions, …) keeps the same handling, then overlays the card spellings.
+ * The world-info spellings remain as fallbacks because builds before this fix
+ * exported the internal shape into the card.
+ */
+function normalizeCharacterBookEntry(raw: Record<string, unknown>, uid: number): CharacterBookEntry {
+  const entry: CharacterBookEntry = normalizeEntry(raw, uid)
+  entry.key = strArray(raw.keys !== undefined ? raw.keys : raw.key)
+  entry.keysecondary = strArray(raw.secondary_keys !== undefined ? raw.secondary_keys : raw.keysecondary)
+  const insertionOrder = raw.insertion_order !== undefined ? raw.insertion_order : raw.order
+  if (typeof insertionOrder === 'number' && Number.isFinite(insertionOrder)) {
+    entry.order = insertionOrder
+  }
+  // `enabled` is the card spelling and the inverse of world-info `disable`;
+  // when both are present the card field wins.
+  if (typeof raw.enabled === 'boolean') entry.disable = !raw.enabled
+  // Cards only know "before_char"/"after_char".  Numeric positions come from
+  // this plugin's earlier exports, so keep those rather than collapsing the
+  // world-info editor's 2..7 variants; a missing position means after_char,
+  // which is what SillyTavern's converter assumes.
+  const position = raw.position
+  if (position === 'before_char') entry.position = 0
+  else if (position === 'after_char') entry.position = 1
+  else if (typeof position === 'number' && Number.isFinite(position)) entry.position = position
+  else if (position === undefined) entry.position = 1
+  const caseSensitive = raw.case_sensitive !== undefined ? raw.case_sensitive : raw.caseSensitive
+  if (typeof caseSensitive === 'boolean') entry.caseSensitive = caseSensitive
+  else if (caseSensitive === null) entry.caseSensitive = null
+  if (typeof raw.name === 'string') entry.name = raw.name
+  if (typeof raw.priority === 'number' && Number.isFinite(raw.priority)) entry.priority = raw.priority
+  return entry
+}
+
+/**
+ * Normalize the embedded `character_book` of a character card.  This is a
+ * separate path from {@link normalizeWorldBook}: the card schema stores
+ * entries as an array with `keys`/`enabled`/`insertion_order`, which the
+ * world-info reader would leave empty.
+ */
+export function normalizeCharacterBook(raw: unknown): WorldBook {
+  if (typeof raw !== 'object' || raw === null) {
+    throw new Error('人物卡内嵌世界书无效：不是对象')
+  }
+  const obj = raw as Record<string, unknown>
+  const entriesRaw = obj.entries
+  let entries: CharacterBookEntry[]
+  if (Array.isArray(entriesRaw)) {
+    const items = entriesRaw
+      .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
+    // `id` is the card-schema identity; fall back to the world-info `uid` so
+    // cards exported by this plugin before the fix keep their numbering.
+    const uids = resolveUids(items.map(item => safeUid(item.id) ?? safeUid(item.uid)))
+    entries = items.map((item, index) => normalizeCharacterBookEntry(item, uids[index]!))
+  } else if (typeof entriesRaw === 'object' && entriesRaw !== null) {
+    // Non-standard uid-keyed object inside a card; may still use card fields.
+    const items = Object.entries(entriesRaw as Record<string, unknown>)
+      .filter((pair): pair is [string, Record<string, unknown>] =>
+        typeof pair[1] === 'object' && pair[1] !== null)
+    const uids = resolveUids(items.map(([key, item]) =>
+      safeUid(Number(key)) ?? safeUid(item.id) ?? safeUid(item.uid)))
+    entries = items.map(([, item], index) => normalizeCharacterBookEntry(item, uids[index]!))
+  } else {
+    entries = []
+  }
+  return { ...bookMetadata(obj), entries }
+}
+
+/**
  * Normalize a world book: accepts the ST uid-keyed object form
  * `{ entries: { "0": {...}, ... } }`, the array form, and the embedded
- * character_book form `{ entries: [...] }` (camelCase field names).
+ * character_book form `{ entries: [...] }`.  Array entries are sniffed one by
+ * one: `keys`/`enabled`/`insertion_order` select the card schema, everything
+ * else keeps the world-info reader unchanged.
  */
 export function normalizeWorldBook(raw: unknown): WorldBook {
   if (typeof raw !== 'object' || raw === null) {
@@ -279,8 +383,12 @@ export function normalizeWorldBook(raw: unknown): WorldBook {
   if (Array.isArray(entriesRaw)) {
     const items = entriesRaw
       .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
-    const uids = resolveUids(items.map(item => safeUid(item.uid)))
-    entries = items.map((item, index) => normalizeEntry(item, uids[index]!))
+    const uids = resolveUids(items.map(item => isCharacterBookEntry(item)
+      ? safeUid(item.id) ?? safeUid(item.uid)
+      : safeUid(item.uid)))
+    entries = items.map((item, index) => isCharacterBookEntry(item)
+      ? normalizeCharacterBookEntry(item, uids[index]!)
+      : normalizeEntry(item, uids[index]!))
   } else if (typeof entriesRaw === 'object' && entriesRaw !== null) {
     // ST world-info file: entries keyed by string uid.
     const items = Object.entries(entriesRaw as Record<string, unknown>)
@@ -291,16 +399,18 @@ export function normalizeWorldBook(raw: unknown): WorldBook {
   } else {
     entries = []
   }
+  return { ...bookMetadata(obj), entries }
+}
+
+/** Serialize the book-level fields shared by both book shapes. */
+function bookRecordFields(book: WorldBook): Record<string, unknown> {
   return {
-    ...(typeof obj.name === 'string' ? { name: obj.name } : {}),
-    ...(typeof obj.description === 'string' ? { description: obj.description } : {}),
-    ...(typeof obj.scan_depth === 'number' ? { scan_depth: obj.scan_depth } : {}),
-    ...(typeof obj.token_budget === 'number' ? { token_budget: obj.token_budget } : {}),
-    ...(typeof obj.recursive_scanning === 'boolean' ? { recursive_scanning: obj.recursive_scanning } : {}),
-    ...(typeof obj.extensions === 'object' && obj.extensions !== null
-      ? { extensions: obj.extensions as Record<string, unknown> }
-      : {}),
-    entries,
+    ...(book.name !== undefined ? { name: book.name } : {}),
+    ...(book.description !== undefined ? { description: book.description } : {}),
+    ...(book.scan_depth !== undefined ? { scan_depth: book.scan_depth } : {}),
+    ...(book.token_budget !== undefined ? { token_budget: book.token_budget } : {}),
+    ...(book.recursive_scanning !== undefined ? { recursive_scanning: book.recursive_scanning } : {}),
+    ...(book.extensions !== undefined ? { extensions: book.extensions } : {}),
   }
 }
 
@@ -319,15 +429,7 @@ export function serializeWorldBookFile(book: WorldBook): Record<string, unknown>
     }
     entries[String(uid)] = { ...serializeEntry(entry), uid }
   }
-  return {
-    ...(book.name !== undefined ? { name: book.name } : {}),
-    ...(book.description !== undefined ? { description: book.description } : {}),
-    ...(book.scan_depth !== undefined ? { scan_depth: book.scan_depth } : {}),
-    ...(book.token_budget !== undefined ? { token_budget: book.token_budget } : {}),
-    ...(book.recursive_scanning !== undefined ? { recursive_scanning: book.recursive_scanning } : {}),
-    ...(book.extensions !== undefined ? { extensions: book.extensions } : {}),
-    entries,
-  }
+  return { ...bookRecordFields(book), entries }
 }
 
 /** Serialize one entry back to the ST top-level + extensions form. */
@@ -413,6 +515,66 @@ function serializeEntry(entry: WorldBookEntry): Record<string, unknown> {
     ...(entry.keyregex !== undefined ? { keyregex: entry.keyregex } : {}),
     extensions: ext,
   }
+}
+
+/**
+ * Serialize one entry to the embedded `character_book` schema (the inverse of
+ * {@link normalizeCharacterBookEntry}).  Only card fields are written: ST's
+ * `convertCharacterBook` looks for `keys`/`enabled`/`insertion_order` and a
+ * string `position`, so emitting the world-info names here would silently
+ * produce a book with no triggers and every entry enabled.
+ */
+function serializeCharacterBookEntry(entry: WorldBookEntry): Record<string, unknown> {
+  // `name` and `priority` are card-only; they live on the canonical entry as
+  // extra properties because WorldBookEntry has no slot for them.
+  const cardEntry = entry as CharacterBookEntry
+  return {
+    id: entry.uid,
+    keys: entry.key,
+    secondary_keys: entry.keysecondary,
+    content: entry.content,
+    enabled: !entry.disable,
+    insertion_order: entry.order,
+    // A card only has two coarse positions; the world-info editor's
+    // AN/EM/depth variants have no card representation, so they export as
+    // after_char — the same fallback SillyTavern's converter uses.
+    position: entry.position === 0 ? 'before_char' : 'after_char',
+    ...(entry.caseSensitive !== null ? { case_sensitive: entry.caseSensitive } : {}),
+    ...(cardEntry.name !== undefined ? { name: cardEntry.name } : {}),
+    ...(cardEntry.priority !== undefined ? { priority: cardEntry.priority } : {}),
+    comment: entry.comment,
+    constant: entry.constant,
+    selective: entry.selective,
+    extensions: entry.extensions,
+  }
+}
+
+/**
+ * Serialize a tavern book into the embedded `character_book` schema of a
+ * character card.  The book-level fields are shared with the world-info file,
+ * but the entries are not interchangeable — see
+ * {@link serializeCharacterBookEntry}.
+ */
+export function serializeCharacterBook(book: WorldBook): Record<string, unknown> {
+  return {
+    ...bookRecordFields(book),
+    entries: book.entries.map(serializeCharacterBookEntry),
+  }
+}
+
+/**
+ * Serialize a stored character card for export.  The canonical card keeps
+ * `character_book.entries` in world-info form, which SillyTavern cannot read
+ * from a card, so the export route must encode this result instead of the
+ * stored object:
+ * `encodePngCardResult(JSON.stringify(serializeCharacterCard(card)), avatar)`.
+ */
+export function serializeCharacterCard(card: CharacterCard): Record<string, unknown> {
+  const data: Record<string, unknown> = { ...card.data }
+  if (card.data.character_book !== undefined) {
+    data.character_book = serializeCharacterBook(card.data.character_book)
+  }
+  return { spec: card.spec, spec_version: card.spec_version, data }
 }
 
 // ── Presets ────────────────────────────────────────────────────────────────

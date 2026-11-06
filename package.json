@@ -22,13 +22,7 @@
       "patch": "./cordis.patch.yml"
     },
     "client": {
-      "platform": "web",
-      "inject": [
-        "@deepseek-ai/dsh-client-ui-conversation",
-        "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-ui-slots"
-      ]
+      "platform": "web"
     }
   },
   "files": [
@@ -37,13 +31,14 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22",
+    "dsh": ">=0.2.2-alpha.3 <0.3.0"
   },
   "scripts": {
     "build": "tsdown",
     "dev:sync": "tsdown && node scripts/sync-profile.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.host.json && tsc --noEmit -p tsconfig.client.json",
-    "verify": "tsdown && node scripts/verify/library.mjs && node scripts/verify/lorebook.mjs && node scripts/verify/prompt.mjs && node scripts/verify/plugin.mjs",
+    "verify": "tsdown && node scripts/verify/library.mjs && node scripts/verify/lorebook.mjs && node scripts/verify/prompt.mjs && node scripts/verify/seed.mjs && node scripts/verify/plugin.mjs",
     "prepare": "npm run build"
   },
   "keywords": [
@@ -55,14 +50,8 @@
   ],
   "license": "MIT",
   "peerDependencies": {
-    "@deepseek-ai/dsh-client-runtime": "*",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
-  },
-  "peerDependenciesMeta": {
-    "@deepseek-ai/dsh-client-runtime": {
-      "optional": true
-    }
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

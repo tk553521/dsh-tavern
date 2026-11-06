@@ -1,6 +1,6 @@
 // Verification of the world-info activation engine.
 // Run with `npm run verify` (needs Node >= 23.6 for native TypeScript).
-import { activateBook, renderWorldInfo, hashSeed } from '../../src/lorebook.ts'
+import { activateBook, activateBooks, renderWorldInfo, hashSeed } from '../../src/lorebook.ts'
 
 const log = []
 const check = (name, ok, extra = '') => {
@@ -24,6 +24,8 @@ const entry = (over = {}) => ({
   triggers: [], extensions: {}, ...over,
 })
 const run = (entries, scan) => activateBook({ entries }, { depth: 0, seed: 1, ...scan })
+const runBooks = (books, scan) =>
+  activateBooks(books.map(entries => ({ entries })), { depth: 0, seed: 1, ...scan })
 const ids = result => result.map(a => a.entry.uid).join(',')
 
 // ── the headline regression: depth no longer gates activation ──
@@ -100,6 +102,20 @@ const ids = result => result.map(a => a.entry.uid).join(',')
   const ms = Date.now() - t0
   check('catastrophic regex refused, not evaluated', result.length === 0 && ms < 200, `${ms}ms`)
 }
+// Ambiguous alternation: the body of the group holds no quantifier, so the
+// old "nested quantifier" guard never fired and a mere 26 characters already
+// cost seconds. Must be refused before compilation, i.e. in microseconds.
+{
+  for (const pattern of ['(a|a)*c', '(?:a|a)+$', '(a|ab)+$', '(?:(a|b))+$']) {
+    const evil = entry({ key: [], keyregex: pattern })
+    const text = 'a'.repeat(40)
+    const t0 = Date.now()
+    const result = run([evil], { text })
+    const ms = Date.now() - t0
+    check(`ambiguous alternation refused, not evaluated: ${pattern}`,
+      result.length === 0 && ms < 50, `${ms}ms`)
+  }
+}
 
 // ── CJK whole-word matching (ST treats CJK as a word boundary; we must too) ──
 {
@@ -140,7 +156,8 @@ const ids = result => result.map(a => a.entry.uid).join(',')
 {
   const first = entry({ uid: 801, key: ['x'], order: 10, position: 4 })
   const second = entry({ uid: 802, key: ['x'], order: 90, position: 0 })
-  check('sorted by order ascending', ids(run([second, first], { text: 'x' })) === '801,802')
+  check('rendered in ascending order (ST appends larger order last)',
+    ids(run([second, first], { text: 'x' })) === '801,802')
 }
 
 // ── budget ──
@@ -148,9 +165,38 @@ const ids = result => result.map(a => a.entry.uid).join(',')
   const big = Array.from({ length: 50 }, (_, i) =>
     entry({ uid: 700 + i, key: ['x'], order: i, content: 'y'.repeat(500) }))
   const result = run(big, { text: 'x' })
+  const text = renderWorldInfo(result)
   check('budget caps the injected block', result.length < 50 && result.length > 0,
     `admitted=${result.length}`)
-  check('budget keeps author priority', result[0].entry.uid === 700)
+  check('rendered block stays inside the budget', text.length <= 8000, `chars=${text.length}`)
+  // ST admits by DESCENDING order, so the last entries (order 49…) win the
+  // budget; uid 700 (order 0) is the first one dropped, not the first kept.
+  const orders = result.map(a => a.entry.order)
+  check('budget keeps the highest author priority (ST: larger order wins)',
+    orders.includes(49) && !orders.includes(0), `orders=${orders.join(',')}`)
+}
+{
+  // The audit's reproduction: two equal entries, a budget that fits one.
+  const low = entry({ uid: 811, key: ['x'], order: 10, content: 'y'.repeat(500) })
+  const high = entry({ uid: 812, key: ['x'], order: 90, content: 'y'.repeat(500) })
+  const result = run([low, high], { text: 'x', budgetChars: 600 })
+  check('order 90 survives a 600-char budget, order 10 is dropped',
+    result.length === 1 && result[0].entry.uid === 812, ids(result))
+}
+
+// ── one budget shared by every book, not one per book ──
+{
+  const first = Array.from({ length: 30 }, (_, i) =>
+    entry({ uid: 1000 + i, key: ['x'], order: i, content: 'y'.repeat(500) }))
+  const second = Array.from({ length: 30 }, (_, i) =>
+    entry({ uid: 2000 + i, key: ['x'], order: 100 + i, content: 'y'.repeat(500) }))
+  const result = runBooks([first, second], { text: 'x', budgetChars: 8000 })
+  const rendered = renderWorldInfo(result).length
+  check('multi-book budget is shared, not per book',
+    rendered <= 8000 && result.length < 60, `entries=${result.length} chars=${rendered}`)
+  check('multi-book admission is global by order (book 2 outranks book 1)',
+    result.every(a => a.entry.order >= 100),
+    `orders=${result.map(a => a.entry.order).join(',')}`)
 }
 
 // ── rendering ──

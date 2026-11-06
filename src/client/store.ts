@@ -3,7 +3,7 @@
  * Business data (characters, lorebooks, presets, plays) lives on the host and
  * is fetched per mount; only navigation and selection survive here.
  */
-import { defineStore, type EngineStoreHandle } from '@deepseek-ai/dsh-client-runtime/client'
+import { defineStore, type StoreDefinition } from '@deepseek-ai/dsh-client-store'
 
 /** Tavern panel tabs inside the view. */
 export type TavernPanel = 'chat' | 'characters' | 'lorebooks' | 'presets' | 'import'
@@ -55,9 +55,11 @@ type TavernActions = {
 
 /**
  * Declares the tavern viewing state and write surface.
- * @returns the store handle.
+ * The returned definition is handed to the slot registration, which mints one
+ * instance per rendered Session scope (the standard store seat).
+ * @returns the store definition.
  */
-export function createTavernStore(): EngineStoreHandle<TavernStoreState, TavernActions> {
+export function createTavernStore(): StoreDefinition<TavernStoreState, TavernActions> {
   return defineStore({
     init: (): TavernStoreState => ({
       panel: 'chat',
