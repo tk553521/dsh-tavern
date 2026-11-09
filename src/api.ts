@@ -463,7 +463,12 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
         if (typeof body?.book !== 'object' || body.book === null) {
           return sendError(res, 400, '缺少世界书内容')
         }
-        const book = validated('世界书', () => normalizeWorldBook(body.book))
+        // Older editors send only name/entries. Omitted book metadata is not
+        // an instruction to erase it; explicit supplied fields still win.
+        const book = validated('世界书', () => normalizeWorldBook({
+          ...existing.book,
+          ...(body.book as Record<string, unknown>),
+        }))
         const updated: WorldBookRecord = {
           ...existing,
           name: typeof body?.name === 'string' && body.name !== '' ? body.name : existing.name,

@@ -149,7 +149,7 @@ dsh plugin --profile web add .
 - 预设：ST 各类型预设 JSON 均接受；`custom_model` 映射为 DSH 模型路由。
 - 聊天：对话完全以 DSH 会话日志为准（可用标准导出能力），资料库只在 `tavern/library/` 存剧本绑定。
 - 偏好：`defaultPresetId`、`style` 在 `$DSH_HOME/tavern/prefs.json`；旧版把资料库放在 settings 文档里的安装，启动时会尝试从 `$DSH_HOME/tavern/legacy-library.json` 或 `settings.yaml.imported` / `settings.yaml` 的 `tavern:` 段恢复。读 YAML 需要可用的 `yaml` 模块，缺它时只打印一条指引，不改原文件。
-- 本地数据目录：接受 TauriTavern 安装根目录（自动查找 `data/default-user`）、data 根目录、`default-user` 目录或其子目录；如存在 `tauritavern-runtime.json`，会参考其中配置的 `data_root`。按源文件去重，可重复执行；不会修改原目录。
+- 本地数据目录：接受 TauriTavern 安装根目录（自动查找 `data/default-user`）、data 根目录、`default-user` 目录或其子目录；如存在 `tauritavern-runtime.json`，会参考其中配置的 `data_root`。按规范化真实数据根目录的 SHA-256 命名空间与相对源文件路径去重，可重复执行；不同安装目录下的同名文件独立导入。旧版无命名空间记录只在内容一致时去重；不会修改原目录。
   > 已知限制：`data_root` 目前只在**位于安装根目录之内**时生效；写成绝对路径或 `..` 跳出安装根会被忽略，此时请直接把那个目录作为导入路径填进来。
 
 ## 开发与构建
@@ -157,7 +157,8 @@ dsh plugin --profile web add .
 - `npm run build` / `npx tsdown`：产出 `lib/index.js`（宿主半，ESM）与 `lib/client.js`（浏览器半，CJS 闭包交给宿主的模块加载器；平台模块从宿主模块表解析）。`lib/` 是构建产物，**不提交进仓库**。
 - `npm run dev:sync`：构建后再把 `lib/` 同步进 `$DSH_HOME/profiles/<profile>/node_modules/dsh-tavern/`（`dsh web` 实际加载的那份快照）。这一步会写项目之外的目录，所以**不放在 `prepare` 里**——`npm install` 不应产生项目外副作用。
 - `npm run typecheck`：宿主与客户端两个独立 TypeScript 程序（避免宿主/客户端 Context 声明合并冲突）；当前工作树两者都是 0 error。
-- `npm run verify`：先构建，再跑 `scripts/verify/` 下的五个断言脚本（资料库、世界书激活语义、提示词围栏、开场白 seed、cordis 插件生命周期），共 **103** 项（19 + 38 + 15 + 8 + 23）。生命周期那一份会在**真实的 cordis root context** 里加载构建产物，用 0.2.2 的服务契约替身断言就绪门控、路由挂载/摘除、可选依赖与配置校验，并用宿主自己的 `entryListProblem` 校验预设声明；seed 那一份把 `greetingSeed()` 交给宿主的 `Session.create` 校验。验证脚本直接用 Node 执行 `.ts`，需要 Node ≥ 23.6（或 22.18+ 的默认类型擦除），并且同样需要「安装」一节里的 `@deepseek-ai` 链接（seed/plugin 脚本会直接 import 宿主包）。
+- `npm run verify`：先构建，再跑 `scripts/verify/` 下的五个断言脚本（资料库、世界书激活语义、提示词围栏、开场白 seed、cordis 插件生命周期），基础断言 **103** 项（19 + 38 + 15 + 8 + 23），再执行 **16** 项回归测试，共 **119** 项。生命周期那一份会在**真实的 cordis root context** 里加载构建产物，用 0.2.2 的服务契约替身断言就绪门控、路由挂载/摘除、可选依赖与配置校验，并用宿主自己的 `entryListProblem` 校验预设声明；seed 那一份把 `greetingSeed()` 交给宿主的 `Session.create` 校验。验证脚本直接用 Node 执行 `.ts`，需要 Node ≥ 23.6（或 22.18+ 的默认类型擦除），并且同样需要「安装」一节里的 `@deepseek-ai` 链接（seed/plugin 脚本会直接 import 宿主包）。
+- `npm run verify:regressions`：独立运行数据并发/删除、头像所有权、跨目录导入、预设清空导出、环境配置、世界书 HTTP 保存与运行时生命周期/回复边界的 16 项回归测试。数据测试使用隔离临时目录；运行时测试通过公共接口搭配 agent 服务替身，不调用真实模型。头像与 HTTP 测试需要 `--experimental-transform-types`（脚本已包含），以支持 TypeScript 参数属性；完整验证仍建议使用 Node 22.18+ 或 24。
 - 类型解析：`@deepseek-ai/*` 通过 `node_modules/@deepseek-ai` 解析（链接方法见「安装」）；三个 tsconfig 都不含绝对路径或 `.ref/` 引用。
 - 宿主半没有运行时 `@deepseek-ai` 导入（`import type` 在转译期擦除）；浏览器半通过宿主模块表加载平台模块。
 

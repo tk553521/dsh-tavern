@@ -77,7 +77,7 @@ function hostList(value: unknown): string[] {
  * @returns a fully populated config.
  */
 export function normalizeConfig(input: unknown): TavernConfig {
-  if (input === undefined || input === null) return { ...DEFAULT_CONFIG }
+  if (input === undefined || input === null) input = {}
   if (typeof input !== 'object' || Array.isArray(input)) {
     throw new Error('酒馆插件配置必须是对象')
   }

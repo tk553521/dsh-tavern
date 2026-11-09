@@ -48,6 +48,8 @@ export interface PrefsScope {
   get(): TavernDatabase
   /** Merge a sparse patch; `undefined` values are ignored, as in a settings patch. */
   update(patch: Partial<TavernDatabase>): Promise<void>
+  /** Optional targeted removal; legacy settings adapters can still replace. */
+  clearDefaultPreset?(): Promise<void>
   /** Replace the whole document. */
   replace(next: TavernDatabase): Promise<void>
 }
@@ -85,6 +87,14 @@ export class PrefsStore implements PrefsScope {
   private readonly path: string
   private readonly logger: LoggerService
   private current: PrefsDocument = emptyPrefs()
+  private tail: Promise<void> = Promise.resolve()
+
+  /** Serialize the entire read/merge/persist transaction, not just the bytes. */
+  private enqueue(task: () => Promise<void>): Promise<void> {
+    const run = this.tail.then(task)
+    this.tail = run.catch(() => {})
+    return run
+  }
 
   /**
    * @param path - absolute path of `prefs.json`.
@@ -137,21 +147,33 @@ export class PrefsStore implements PrefsScope {
   }
 
   /** Merge a sparse patch and persist the result. */
-  async update(patch: Partial<TavernDatabase>): Promise<void> {
-    const next = emptyPrefs()
-    const defaultPresetId = patch.defaultPresetId ?? this.current.defaultPresetId
-    const style = patch.style ?? this.current.style
-    if (defaultPresetId !== undefined) next.defaultPresetId = defaultPresetId
-    if (style !== undefined) next.style = style
-    await this.write(next)
+  update(patch: Partial<TavernDatabase>): Promise<void> {
+    const supplied = { ...patch }
+    return this.enqueue(async () => {
+      const next = emptyPrefs()
+      const defaultPresetId = supplied.defaultPresetId ?? this.current.defaultPresetId
+      const style = supplied.style ?? this.current.style
+      if (defaultPresetId !== undefined) next.defaultPresetId = defaultPresetId
+      if (style !== undefined) next.style = style
+      await this.write(next)
+    })
   }
 
-  /** Replace the document wholesale (used to clear a preference). */
+  /** Remove only the preset key, merging against the latest queued state. */
+  clearDefaultPreset(): Promise<void> {
+    return this.enqueue(async () => {
+      const next = { ...this.current }
+      delete next.defaultPresetId
+      await this.write(next)
+    })
+  }
+
+  /** Replace the document wholesale. */
   async replace(next: TavernDatabase): Promise<void> {
     const document = emptyPrefs()
     if (next.defaultPresetId !== undefined) document.defaultPresetId = next.defaultPresetId
     if (next.style !== undefined) document.style = next.style
-    await this.write(document)
+    await this.enqueue(() => this.write(document))
   }
 
   /**

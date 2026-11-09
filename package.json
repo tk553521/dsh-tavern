@@ -38,7 +38,8 @@
     "build": "tsdown",
     "dev:sync": "tsdown && node scripts/sync-profile.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.host.json && tsc --noEmit -p tsconfig.client.json",
-    "verify": "tsdown && node scripts/verify/library.mjs && node scripts/verify/lorebook.mjs && node scripts/verify/prompt.mjs && node scripts/verify/seed.mjs && node scripts/verify/plugin.mjs",
+    "verify": "tsdown && node scripts/verify/library.mjs && node scripts/verify/lorebook.mjs && node scripts/verify/prompt.mjs && node scripts/verify/seed.mjs && node scripts/verify/plugin.mjs && npm run verify:regressions",
+    "verify:regressions": "node --experimental-transform-types scripts/verify/data-regressions.mjs && node scripts/verify/codec-config-regressions.mjs && node --experimental-transform-types scripts/verify/api-regressions.mjs && node scripts/verify/runtime-regressions.mjs",
     "prepare": "npm run build"
   },
   "keywords": [

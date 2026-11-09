@@ -619,7 +619,9 @@ export function serializePreset(preset: Preset): Record<string, unknown> {
   const out: Record<string, unknown> = { ...(preset.raw ?? {}) }
   out.name = preset.name
   const set = (key: string, value: number | undefined): void => {
+    // Known fields are owned by the normalized record, including absence.
     if (value !== undefined) out[key] = value
+    else delete out[key]
   }
   set('max_tokens', preset.maxTokens)
   set('temp', preset.temperature)
@@ -634,6 +636,7 @@ export function serializePreset(preset: Preset): Record<string, unknown> {
   set('presence_penalty', preset.presencePenalty)
   set('frequency_penalty', preset.frequencyPenalty)
   if (preset.model !== undefined) out.custom_model = preset.model
+  else delete out.custom_model
   return out
 }
 

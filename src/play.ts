@@ -143,11 +143,11 @@ function roleSessionId(playId: string, characterId: string): SessionId {
 }
 
 /** Extract the final assistant text from an agent's session log. */
-export function lastAssistantText(session: Session): string {
+export function lastAssistantText(session: Session, after = 0): string {
   // `Session.events` is gone in 0.2.2-alpha.3; the log is read through
   // `snapshotEvents()` (a frozen, detached array of the selected range).
   const events = session.snapshotEvents()
-  for (let index = events.length - 1; index >= 0; index--) {
+  for (let index = events.length - 1; index >= after; index--) {
     const event = events[index]
     if (event === undefined) continue
     if (event.type !== 'assistant/message') continue
@@ -274,6 +274,39 @@ export class TavernSessionRuntime {
   private readonly directorInflight = new Map<string, Promise<AgentHandle>>()
   /** `${playId}:${characterId}` → in-flight role assembly (same race as the director). */
   private readonly roleInflight = new Map<string, Promise<AgentHandle>>()
+  private closed = false
+  private disposal: Promise<void> | undefined
+  private readonly playEpochs = new Map<string, number>()
+  private readonly dropInflight = new Map<string, Promise<void>>()
+
+  private epoch(playId: string): number {
+    return this.playEpochs.get(playId) ?? 0
+  }
+
+  private assertActive(playId: string, epoch = this.epoch(playId)): void {
+    if (this.closed || this.dropInflight.has(playId) || epoch !== this.epoch(playId)) {
+      throw conflict('酒馆会话已关闭或正在清理，请重新打开')
+    }
+  }
+
+  /** Late creations own their handle until it can be safely published. */
+  private async completeAssembly(
+    playId: string, epoch: number, handle: AgentHandle, sessionId: SessionId,
+    publish: () => void,
+  ): Promise<AgentHandle> {
+    try {
+      this.assertActive(playId, epoch)
+      await this.hideFromWorkspace(sessionId)
+      this.assertActive(playId, epoch)
+      publish()
+      return handle
+    } catch (error: unknown) {
+      await handle.dispose().catch(disposeError => {
+        this.deps.logger.error(`tavern: late agent disposal failed: ${String(disposeError)}`)
+      })
+      throw error
+    }
+  }
 
   /**
    * Declared explicitly rather than as a constructor parameter property: this
@@ -295,18 +328,26 @@ export class TavernSessionRuntime {
    * single agent had actually released its session — a reload could then race
    * the old agents against the new ones over the same session ids.
    */
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
+    if (this.disposal !== undefined) return this.disposal
+    this.closed = true
     const handles: AgentHandle[] = [...this.directors.values()]
     for (const byPlay of this.roles.values()) handles.push(...byPlay.values())
     this.directors.clear()
     this.roles.clear()
     this.speakQueues.clear()
-    const settled = await Promise.allSettled(handles.map(handle => handle.dispose()))
-    for (const result of settled) {
-      if (result.status === 'rejected') {
-        this.deps.logger.error(`tavern: agent disposal failed: ${String(result.reason)}`)
+    const pending = [...this.directorInflight.values(), ...this.roleInflight.values(), ...this.dropInflight.values()]
+    this.disposal = (async () => {
+      const settled = await Promise.allSettled(handles.map(handle => handle.dispose()))
+      for (const result of settled) {
+        if (result.status === 'rejected') {
+          this.deps.logger.error(`tavern: agent disposal failed: ${String(result.reason)}`)
+        }
       }
-    }
+      // Pending assemblies observe closed and release their own late handles.
+      await Promise.allSettled(pending)
+    })()
+    return this.disposal
   }
 
   /** Run one tavern_speak task after any previous task for the same agent settles. */
@@ -332,6 +373,8 @@ export class TavernSessionRuntime {
    * tavern page only.
    */
   async ensureDirector(play: Play, seedOverride?: readonly SessionEvent[]): Promise<AgentHandle> {
+    this.assertActive(play.id)
+    const epoch = this.epoch(play.id)
     const existing = this.directors.get(play.id)
     if (existing !== undefined) return existing
     // Concurrent activations (double-click, a retry racing a select) share
@@ -340,7 +383,7 @@ export class TavernSessionRuntime {
     // orphan agent nobody can dispose.
     const inflight = this.directorInflight.get(play.id)
     if (inflight !== undefined) return inflight
-    const attempt = this.createDirector(play, seedOverride)
+    const attempt = this.createDirector(play, epoch, seedOverride)
     this.directorInflight.set(play.id, attempt)
     try {
       return await attempt
@@ -350,7 +393,7 @@ export class TavernSessionRuntime {
   }
 
   /** The single assembly attempt behind {@link ensureDirector}. */
-  private async createDirector(play: Play, seedOverride?: readonly SessionEvent[]): Promise<AgentHandle> {
+  private async createDirector(play: Play, epoch: number, seedOverride?: readonly SessionEvent[]): Promise<AgentHandle> {
     const storage = this.deps.storage
     const characters = play.characterIds
       .map(id => storage.getCharacter(id))
@@ -369,7 +412,9 @@ export class TavernSessionRuntime {
     // legacy play predating the tavern preset has none recorded and resumes
     // bare, as before); a fresh session composes the tavern preset.
     await this.deps.ensurePreset()
+    this.assertActive(play.id, epoch)
     const persisted = await this.persistedSession(sessionId)
+    this.assertActive(play.id, epoch)
     const setup = this.sessionSetup(
       persisted.preset ?? TAVERN_PRESET_ID,
       directorSystem,
@@ -417,9 +462,9 @@ export class TavernSessionRuntime {
         ...(seed !== undefined ? { seed } : {}),
       })
     }
-    this.directors.set(play.id, handle)
-    await this.hideFromWorkspace(sessionId)
-    return handle
+    return this.completeAssembly(play.id, epoch, handle, sessionId, () => {
+      this.directors.set(play.id, handle)
+    })
   }
 
   /**
@@ -731,11 +776,15 @@ export class TavernSessionRuntime {
       throw new Error('tavern_speak: 角色列表为空')
     }
 
+    this.assertActive(play.id)
+    const epoch = this.epoch(play.id)
     const instruction = args.instruction ?? `请以${target.card.data.name}的身份说下一句台词。`
     const handle = await this.ensureRoleAgent(play, target)
     return this.enqueueSpeak(String(handle.agent.id), async () => {
+      this.assertActive(play.id, epoch)
       const signal = exec.signal
-      const done = handle.agent.whenIdle()
+      if (signal.aborted) throw new Error('调用已取消')
+      const boundary = handle.agent.session.snapshotEvents().length
       try {
         handle.agent.followup(userMessage(instruction))
       } catch (error: unknown) {
@@ -745,23 +794,19 @@ export class TavernSessionRuntime {
           `${target.card.data.name} 的角色会话不可用：${error instanceof Error ? error.message : String(error)}`,
         )
       }
-      const wait = done.catch(() => {})
+      // whenIdle observes current activity, so subscribe AFTER followup wakes
+      // the driver; an idle subscription before followup can settle immediately.
+      const wait = handle.agent.whenIdle()
       let onAbort: (() => void) | undefined
+      let timer: ReturnType<typeof setTimeout> | undefined
       const timeout = new Promise<never>((_, reject) => {
-        const timer = setTimeout(() => reject(new Error('角色回应超时')), this.deps.config.speakTimeoutMs)
-        onAbort = () => {
-          clearTimeout(timer)
-          reject(new Error('调用已取消'))
-        }
+        timer = setTimeout(() => reject(new Error('角色回应超时')), this.deps.config.speakTimeoutMs)
+        onAbort = () => reject(new Error('调用已取消'))
         if (signal.aborted) {
           onAbort()
           return
         }
         signal.addEventListener('abort', onAbort, { once: true })
-        void wait.then(() => {
-          clearTimeout(timer)
-          signal.removeEventListener('abort', onAbort!)
-        })
       })
       try {
         await Promise.race([wait, timeout])
@@ -786,8 +831,18 @@ export class TavernSessionRuntime {
           // Already disposed: the failure below is the one worth reporting.
         }
         throw error
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+        if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
       }
-      const reply = lastAssistantText(handle.agent.session)
+      this.assertActive(play.id, epoch)
+      const events = handle.agent.session.snapshotEvents().slice(boundary)
+      const end = [...events].reverse().find(event => event.type === 'turn/end')
+      if (end?.type !== 'turn/end'
+        || (end.data.reason.kind !== 'completed' && end.data.reason.kind !== 'max-tokens')) {
+        throw new Error(`${target.card.data.name} 的本次回复未成功完成`)
+      }
+      const reply = lastAssistantText(handle.agent.session, boundary)
       if (reply.trim() === '') {
         throw new Error(`${target.card.data.name} 没有产出回复`)
       }
@@ -797,6 +852,8 @@ export class TavernSessionRuntime {
 
   /** Create (or reuse) the character agent for one play (multi-agent mode). */
   private async ensureRoleAgent(play: Play, character: CharacterRecord): Promise<AgentHandle> {
+    this.assertActive(play.id)
+    const epoch = this.epoch(play.id)
     {
       const existing = this.roles.get(play.id)?.get(character.id)
       if (existing !== undefined) return existing
@@ -806,7 +863,7 @@ export class TavernSessionRuntime {
     // on an unchecked map must not spawn a second, orphaned agent.
     const inflight = this.roleInflight.get(key)
     if (inflight !== undefined) return inflight
-    const attempt = this.createRoleAgent(play, character)
+    const attempt = this.createRoleAgent(play, character, epoch)
     this.roleInflight.set(key, attempt)
     try {
       return await attempt
@@ -816,13 +873,8 @@ export class TavernSessionRuntime {
   }
 
   /** The single assembly attempt behind {@link ensureRoleAgent}. */
-  private async createRoleAgent(play: Play, character: CharacterRecord): Promise<AgentHandle> {
-    let byPlay = this.roles.get(play.id)
-    if (byPlay === undefined) {
-      byPlay = new Map()
-      this.roles.set(play.id, byPlay)
-    }
-    const existing = byPlay.get(character.id)
+  private async createRoleAgent(play: Play, character: CharacterRecord, epoch: number): Promise<AgentHandle> {
+    const existing = this.roles.get(play.id)?.get(character.id)
     if (existing !== undefined) return existing
 
     const lorebooks = this.playLorebooks(play)
@@ -846,7 +898,9 @@ export class TavernSessionRuntime {
     // preset (legacy role sessions resume bare), fresh sessions compose the
     // tavern preset.
     await this.deps.ensurePreset()
+    this.assertActive(play.id, epoch)
     const persisted = await this.persistedSession(sessionId)
+    this.assertActive(play.id, epoch)
     const setup = this.sessionSetup(persisted.preset ?? TAVERN_PRESET_ID, system, loreContext)
 
     const agentOptions = {
@@ -879,27 +933,47 @@ export class TavernSessionRuntime {
         setup,
       })
     }
-    byPlay.set(character.id, handle)
-    await this.hideFromWorkspace(sessionId)
-    return handle
+    return this.completeAssembly(play.id, epoch, handle, sessionId, () => {
+      let byPlay = this.roles.get(play.id)
+      if (byPlay === undefined) {
+        byPlay = new Map()
+        this.roles.set(play.id, byPlay)
+      }
+      byPlay.set(character.id, handle)
+    })
   }
 
   /** Drop the live agents of one play (play deleted). */
-  async dropPlay(playId: string): Promise<void> {
+  dropPlay(playId: string): Promise<void> {
+    const existing = this.dropInflight.get(playId)
+    if (existing !== undefined) return existing
+    this.playEpochs.set(playId, this.epoch(playId) + 1)
+    const handles: AgentHandle[] = []
     const director = this.directors.get(playId)
-    if (director !== undefined) {
-      this.directors.delete(playId)
-      this.speakQueues.delete(String(director.agent.id))
-      await director.dispose()
-    }
+    if (director !== undefined) handles.push(director)
     const byPlay = this.roles.get(playId)
-    if (byPlay !== undefined) {
-      this.roles.delete(playId)
-      for (const handle of byPlay.values()) {
-        this.speakQueues.delete(String(handle.agent.id))
-        await handle.dispose()
-      }
+    if (byPlay !== undefined) handles.push(...byPlay.values())
+    this.directors.delete(playId)
+    this.roles.delete(playId)
+    for (const handle of handles) this.speakQueues.delete(String(handle.agent.id))
+    const pending: Promise<unknown>[] = []
+    const directorAttempt = this.directorInflight.get(playId)
+    if (directorAttempt !== undefined) pending.push(directorAttempt)
+    for (const [key, attempt] of this.roleInflight) {
+      if (key.startsWith(`${playId}:`)) pending.push(attempt)
     }
+    const run = (async () => {
+      const disposed = await Promise.allSettled(handles.map(handle => handle.dispose()))
+      await Promise.allSettled(pending)
+      const failed = disposed.find(result => result.status === 'rejected')
+      if (failed?.status === 'rejected') throw failed.reason
+    })()
+    this.dropInflight.set(playId, run)
+    const clear = (): void => {
+      if (this.dropInflight.get(playId) === run) this.dropInflight.delete(playId)
+    }
+    void run.then(clear, clear)
+    return run
   }
 
   // ── Retry / swipe / edit (session forks) ────────────────────────────────

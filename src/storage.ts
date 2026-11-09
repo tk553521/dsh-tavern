@@ -248,7 +248,11 @@ export class TavernStorage {
 
   async setDefaultPreset(id: string | undefined): Promise<void> {
     if (id === undefined) {
-      // A sparse patch cannot express key removal (an `undefined` value is
+      if (this.prefs.clearDefaultPreset !== undefined) {
+        await this.prefs.clearDefaultPreset()
+        return
+      }
+      // Legacy adapters: a sparse patch cannot express key removal (an `undefined` value is
       // dropped, exactly as a settings patch did), so the document is
       // replaced instead.
       const section = this.prefs.get()

@@ -71,8 +71,13 @@ function fileFromAvatar(avatar: string | undefined): string | undefined {
   if (avatar === undefined) return undefined
   const normalized = avatar.replace(/\\/g, '/')
   if (!normalized.startsWith(`${AVATAR_DIR_RELATIVE}/`)) return undefined
-  const file = normalized.slice(AVATAR_DIR_RELATIVE.length + 1).split('/').pop() ?? ''
+  const file = normalized.slice(AVATAR_DIR_RELATIVE.length + 1)
   return SAFE_FILE_RE.test(file) ? file : undefined
+}
+
+/** Files are owned by the record whose id is their filename stem. */
+function ownsFile(id: string, file: string): boolean {
+  return file.slice(0, file.lastIndexOf('.')) === id
 }
 
 /** Options for {@link AvatarStore.materializeCharacter}. */
@@ -146,7 +151,19 @@ export class AvatarStore {
     const avatar = record.avatar
     if (avatar === undefined) return record
     if (!avatar.startsWith('data:')) {
-      if (fileFromAvatar(avatar) !== undefined) return record
+      const sourceFile = fileFromAvatar(avatar)
+      if (sourceFile !== undefined) {
+        if (ownsFile(record.id, sourceFile)) return record
+        // Old shared references and copied cards retain their image, but each
+        // record gets its own file before it may update or delete that image.
+        const source = await this.read(sourceFile)
+        if (source !== undefined && source.bytes.length <= MAX_AVATAR_BYTES) {
+          return this.materializeCharacter({
+            ...record,
+            avatar: `data:${source.contentType};base64,${source.bytes.toString('base64')}`,
+          }, previous, options)
+        }
+      }
       if (options.keepUnsupported === true) {
         this.logger.error('tavern avatar: cannot migrate unrecognized avatar for character %s; keeping it unchanged', record.id)
         return record
@@ -196,7 +213,9 @@ export class AvatarStore {
    */
   private async removePrevious(current: string, previous?: CharacterRecord): Promise<void> {
     const previousFile = previous !== undefined ? fileFromAvatar(previous.avatar) : undefined
-    if (previousFile === undefined || previousFile.toLowerCase() === current.toLowerCase()) return
+    if (previousFile === undefined || previous === undefined
+      || !ownsFile(previous.id, previousFile) || !ownsFile(previous.id, current)
+      || previousFile.toLowerCase() === current.toLowerCase()) return
     await rm(this.filePath(previousFile), { force: true }).catch(() => void 0)
   }
 
@@ -278,7 +297,7 @@ export class AvatarStore {
   /** Remove the on-disk avatar for a deleted character. */
   async removeCharacter(record: CharacterRecord): Promise<void> {
     const file = fileFromAvatar(record.avatar)
-    if (file === undefined) return
-    await rm(this.filePath(file), { force: true }).catch(() => void 0)
+    if (file === undefined || !ownsFile(record.id, file)) return
+    await this.serialize(record.id, () => rm(this.filePath(file), { force: true }).catch(() => void 0))
   }
 }

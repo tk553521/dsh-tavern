@@ -24,6 +24,7 @@
 
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 
 import { normalizeCard, normalizeWorldBook, importPreset } from './cardcodec.ts'
 import { parsePngCard } from './png.ts'
@@ -349,6 +350,14 @@ function normalizeSource(source: string): string {
   return source.replace(/\\/g, '/').toLowerCase()
 }
 
+/** Keep portable relative diagnostics, but namespace persisted identities by real root. */
+function importSource(userDir: string, relative: string): string {
+  const root = userDir.replace(/\\/g, '/')
+  const canonical = process.platform === 'win32' ? root.toLowerCase() : root
+  const namespace = createHash('sha256').update(canonical).digest('hex')
+  return `tauritavern/${namespace}/${relative.replace(/\\/g, '/')}`
+}
+
 /** Idempotence for world books imported before the source field existed. */
 function dedupeLorebooks(
   existing: readonly WorldBookRecord[],
@@ -450,7 +459,7 @@ async function readCharacterFile(
     }
     return {
       id: newId('char'),
-      source,
+      source: importSource(ctx.userDir, source),
       ...(avatar !== undefined ? { avatar } : {}),
       createdAt: nowIso(),
       updatedAt: nowIso(),
@@ -513,7 +522,7 @@ async function importCharacterJournalRecords(
         : entry.value
       records.push({
         id: newId('char'),
-        source,
+        source: importSource(ctx.userDir, source),
         createdAt: nowIso(),
         updatedAt: nowIso(),
         card: normalizeCard(rawCard, source),
@@ -530,6 +539,7 @@ async function importCharacters(
   ctx: ImportContext,
   charactersDir: string,
   isImported: (source: string) => boolean,
+  isLegacyImported: (record: CharacterRecord) => boolean,
 ): Promise<CharacterRecord[]> {
   const allFiles = await listFiles(ctx, charactersDir, 'character')
   const normalFiles = allFiles.filter(name => /\.(png|json)$/i.test(name))
@@ -538,7 +548,7 @@ async function importCharacters(
   for (const file of normalFiles) {
     if (isImported(relativeTo(ctx.userDir, path.join(charactersDir, file)))) continue
     const record = await readCharacterFile(ctx, charactersDir, file)
-    if (record === undefined) continue
+    if (record === undefined || isLegacyImported(record)) continue
     // Written to disk before the next card is read: holding every card's base64
     // avatar until the batch ends costs ~1.2GB for 500 one-megabyte cards, and
     // only the on-disk path is persisted anyway.
@@ -550,7 +560,8 @@ async function importCharacters(
   // they win; the journal is only used as a recovery fallback.
   if (normalFiles.length === 0) {
     const journalFiles = allFiles.filter(name => !/\.(png|json)$/i.test(name))
-    records.push(...await importCharacterJournalRecords(ctx, charactersDir, journalFiles, isImported))
+    const journal = await importCharacterJournalRecords(ctx, charactersDir, journalFiles, isImported)
+    records.push(...journal.filter(record => !isLegacyImported(record)))
   }
 
   return records
@@ -579,7 +590,7 @@ async function importLorebooks(ctx: ImportContext, worldsDir: string): Promise<W
       records.push({
         id: newId('book'),
         name,
-        source,
+        source: importSource(ctx.userDir, source),
         createdAt: nowIso(),
         updatedAt: nowIso(),
         book,
@@ -614,7 +625,7 @@ async function importPresets(ctx: ImportContext): Promise<Preset[]> {
           ? rawName
           : path.basename(file, '.json')
         const preset = importPreset(raw, newId('preset'), name)
-        records.push({ ...preset, source })
+        records.push({ ...preset, source: importSource(ctx.userDir, source) })
       } catch (error) {
         ctx.logger.warn('tavern import: cannot parse preset %s: %s', source, String(error))
         ctx.issues.push({ category: 'preset', file: source, reason: REASON_INVALID })
@@ -684,10 +695,14 @@ export async function importTauriTavernData(
       .map(record => record.source)
       .filter((source): source is string => source !== undefined)
       .map(normalizeSource))
+    const legacyCards = new Set(db.characters
+      .filter(record => record.source !== undefined && !record.source.startsWith('tauritavern/'))
+      .map(record => `${normalizeSource(record.source!)}\u0000${JSON.stringify(record.card)}`))
     const records = await importCharacters(
       ctx,
       path.join(resolved.userDir, 'characters'),
-      source => importedSources.has(normalizeSource(source)),
+      source => importedSources.has(normalizeSource(importSource(ctx.userDir, source))),
+      record => legacyCards.has(`${normalizeSource(record.source!.split('/').slice(2).join('/'))}\u0000${JSON.stringify(record.card)}`),
     )
     await storage.appendCharacters(records)
     report.imported.characters = records.length

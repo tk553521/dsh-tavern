@@ -77,6 +77,19 @@ export class LibraryStore {
 
   private readonly root: string
   private readonly logger: LibraryLogger
+  private readonly mutationTails = new Map<string, Promise<void>>()
+
+  /** Order complete record mutations, including deletion and index publication. */
+  private enqueue(collection: Collection, key: string, task: () => Promise<void>): Promise<void> {
+    const queueKey = `${collection}/${key}`
+    const run = (this.mutationTails.get(queueKey) ?? Promise.resolve()).then(task)
+    const settled = run.catch(() => {})
+    this.mutationTails.set(queueKey, settled)
+    void settled.then(() => {
+      if (this.mutationTails.get(queueKey) === settled) this.mutationTails.delete(queueKey)
+    })
+    return run
+  }
 
   /**
    * Construct the index without touching the disk. The plugin provides its
@@ -152,22 +165,25 @@ export class LibraryStore {
   /** Persist one record and index it. */
   private async put(collection: Collection, key: string, value: unknown): Promise<void> {
     if (!isSafeId(key)) throw new Error(`tavern library: 非法记录 id：${key}`)
-    await writeAtomic(join(this.root, collection, `${key}.json`), JSON.stringify(value))
-    this.maps[collection].set(key, value)
+    const data = JSON.stringify(value)
+    await this.enqueue(collection, key, async () => {
+      await writeAtomic(join(this.root, collection, `${key}.json`), data)
+      this.maps[collection].set(key, value)
+    })
   }
 
   /** Remove one record from disk and the index. Missing files are fine. */
   private async drop(collection: Collection, key: string): Promise<void> {
     if (!isSafeId(key)) return
-    try {
-      // File first, index second. The old order deleted the index entry and
-      // then swallowed a failed `rm`, so a record the UI reported as deleted
-      // reappeared on the next start — worse than refusing the delete.
-      await rm(join(this.root, collection, `${key}.json`), { force: true })
-    } catch (error: unknown) {
-      throw new Error(`tavern library: cannot delete ${collection}/${key}: ${String(error)}`)
-    }
-    this.maps[collection].delete(key)
+    await this.enqueue(collection, key, async () => {
+      try {
+        // Earlier saves must settle before deleting both the file and index.
+        await rm(join(this.root, collection, `${key}.json`), { force: true })
+      } catch (error: unknown) {
+        throw new Error(`tavern library: cannot delete ${collection}/${key}: ${String(error)}`)
+      }
+      this.maps[collection].delete(key)
+    })
   }
 
   private all<T>(collection: Collection): T[] {

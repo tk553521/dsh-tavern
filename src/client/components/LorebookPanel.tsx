@@ -147,7 +147,7 @@ function LorebookEditor(props: {
   const save = async (): Promise<void> => {
     setSaving(true)
     try {
-      await props.api.updateLorebook(props.book.id, { name, entries }, name)
+      await props.api.updateLorebook(props.book.id, { ...props.book.book, name, entries }, name)
       await props.onChanged()
     } catch (error) {
       props.onError(error instanceof Error ? error.message : String(error))
