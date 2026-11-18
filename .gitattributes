@@ -1,0 +1,15 @@
+# Keep the repository byte-stable across platforms.
+#
+# Everything this repo ships is text (TypeScript, JSON, YAML, Markdown) and
+# `scripts/verify/` compares derived bytes and hashes, so a Windows checkout must
+# not rewrite LF into CRLF. Contributors on Windows: do not disable this.
+* text=auto eol=lf
+
+# The lockfile is compared by npm; never let a checkout rewrite its line endings.
+package-lock.json -text
+
+# Imported test fixtures, if any are ever checked in, must stay byte-identical.
+*.png binary
+*.jpg binary
+*.webp binary
+*.gif binary

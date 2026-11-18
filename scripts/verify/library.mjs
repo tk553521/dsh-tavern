@@ -8,7 +8,7 @@ import { TavernStorage, emptyDatabase, EMPTY_DATABASE, newId, nowIso } from '../
 
 const log = []
 const check = (name, ok, extra = '') => {
-  log.push(`${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? ' 鈥?' + extra : ''}`)
+  log.push(`${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? ' — ' + extra : ''}`)
   if (!ok) process.exitCode = 1
 }
 const quiet = { warn: () => {}, info: () => {} }
