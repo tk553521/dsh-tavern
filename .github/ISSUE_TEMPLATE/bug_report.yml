@@ -1,0 +1,76 @@
+name: Bug 报告
+description: 插件行为不符合预期、报错、界面异常
+title: "[bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。提交前请先确认：**不要在公开 issue 里贴角色卡原文、世界书内容、聊天记录、`$DSH_HOME` 路径或凭据。**
+        安全漏洞请走 [私密报告](https://github.com/tk553521/dsh-tavern/security/advisories/new)。
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: 插件版本
+      description: 来自 `$DSH_HOME/profiles/<profile>/node_modules/dsh-tavern/package.json` 的 version，或你 clone 的 commit。
+      placeholder: 0.1.0 / commit 3edcaf8
+    validations:
+      required: true
+
+  - type: input
+    id: dsh-version
+    attributes:
+      label: DSH 版本与安装方式
+      description: "engines.dsh 要求 >=0.2.2-alpha.3 <0.3.0。"
+      placeholder: 桌面版 0.2.2-alpha.3
+    validations:
+      required: true
+
+  - type: input
+    id: node-os
+    attributes:
+      label: Node 版本与操作系统
+      placeholder: Node 24.11 / Windows 11
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 越具体越好；涉及导入的卡/世界书请使用虚构的最小样本。
+      placeholder: |
+        1. 酒馆 → 导入 → 选择 sample.json
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: 如果界面报错，请附上错误提示与错误编号。
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志（脱敏后）
+      description: "dsh web 的终端输出里以 tavern 开头的行。删除路径、聊天内容与凭据后再贴。"
+      render: text
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我已在当前 `main` 上复现（不是更早的快照或个人修改构建）
+        - label: 我使用的是公开版本，未提交任何用户数据

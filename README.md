@@ -1,11 +1,16 @@
 # dsh-tavern（DSH 酒馆）
 
+[![CI](https://github.com/tk553521/dsh-tavern/actions/workflows/ci.yml/badge.svg)](https://github.com/tk553521/dsh-tavern/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+**接受 PR**
+
 SillyTavern / TauriTavern 风格的角色扮演插件，作为 DeepSeek Harness (DSH) 的外部插件运行：
 在 Web 界面的「对话」「轨迹」标签右侧新增 **「酒馆」** 标签，提供**人物卡、世界书、预设**管理，
 以及遵循 DSH 范式的**多 agent 角色扮演**。
 
 宿主版本要求见 `package.json` 的 `engines.dsh`：`>=0.2.2-alpha.3 <0.3.0`。仓库自带的
-`npm run verify` 覆盖资料库、世界书、提示词、开场白与插件生命周期；宿主实机上的完整扮演链路
+`npm run verify` 覆盖资料库、世界书、提示词、开场白与插件生命周期；`npm run verify:ci` 是它的
+免宿主子集（不需要链接 `@deepseek-ai`），每个 PR 的 CI 都跑这一份。宿主实机上的完整扮演链路
 （会话恢复、世界书注入、重试/Swipe）以目标 DSH 版本的实际运行为准。
 
 ## 设计：一切通过 DSH
@@ -160,7 +165,17 @@ dsh plugin --profile web add .
 - `npm run verify`：先构建，再跑 `scripts/verify/` 下的五个断言脚本（资料库、世界书激活语义、提示词围栏、开场白 seed、cordis 插件生命周期），基础断言 **103** 项（19 + 38 + 15 + 8 + 23），再执行 **16** 项回归测试，共 **119** 项。生命周期那一份会在**真实的 cordis root context** 里加载构建产物，用 0.2.2 的服务契约替身断言就绪门控、路由挂载/摘除、可选依赖与配置校验，并用宿主自己的 `entryListProblem` 校验预设声明；seed 那一份把 `greetingSeed()` 交给宿主的 `Session.create` 校验。验证脚本直接用 Node 执行 `.ts`，需要 Node ≥ 23.6（或 22.18+ 的默认类型擦除），并且同样需要「安装」一节里的 `@deepseek-ai` 链接（seed/plugin 脚本会直接 import 宿主包）。
 - `npm run verify:regressions`：独立运行数据并发/删除、头像所有权、跨目录导入、预设清空导出、环境配置、世界书 HTTP 保存与运行时生命周期/回复边界的 16 项回归测试。数据测试使用隔离临时目录；运行时测试通过公共接口搭配 agent 服务替身，不调用真实模型。头像与 HTTP 测试需要 `--experimental-transform-types`（脚本已包含），以支持 TypeScript 参数属性；完整验证仍建议使用 Node 22.18+ 或 24。
 - 类型解析：`@deepseek-ai/*` 通过 `node_modules/@deepseek-ai` 解析（链接方法见「安装」）；三个 tsconfig 都不含绝对路径或 `.ref/` 引用。
-- 宿主半没有运行时 `@deepseek-ai` 导入（`import type` 在转译期擦除）；浏览器半通过宿主模块表加载平台模块。
+- 宿主半没有运行时 `@deepseek-ai` 导入（`import type` 在转译期擦除）；浏览器半通过宿主模块表加载平台模块。这两条不变式由 `scripts/ci/check-host-bundle.mjs` 在 CI 里拦。
+- `npm run verify:ci`：`verify` 的免宿主子集（资料库 + 世界书 + 提示词 + 全部回归测试 + 产物模块边界检查），不需要「安装」一节里的 `@deepseek-ai` 链接，CI 的 `verify` 检查跑的就是它。
+
+## 贡献
+
+接受外部 PR，两个前提：
+
+- **不提交构建产物与用户数据。** `lib/` 是构建产物（`.gitignore` 已忽略）；角色卡、世界书、聊天记录、头像、个人路径、凭据都不进仓库，测试用 `scripts/verify/` 里那种虚构夹具。
+- **CI 要绿。** 每个 PR 会跑 [CI](.github/workflows/ci.yml) 的 `build` 与 `verify`；`verify` 跑的是 `npm run verify:ci`，本地可先自检（不需要链接 `@deepseek-ai`）。改了 `src/` 的类型请在 PR 里带上本机 `npm run typecheck` 的结果。
+
+依赖某个更高版本宿主 API 时，在 PR 里写明最低可用 DSH 版本与缺失时的降级行为。安全漏洞请用 GitHub 的私密漏洞报告，不要公开贴利用细节或用户数据。
 
 ## 已知限制
 

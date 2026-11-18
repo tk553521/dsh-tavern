@@ -1,0 +1,50 @@
+name: 功能建议
+description: 想要的新能力、宿主集成或行为调整
+title: "[feat] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        功能建议请先说明使用场景，再谈实现。本插件的预设不挂载任何工具、系统提示只有一个 `complete` 段，
+        涉及这两点的改动会被重点审查（见 README「安全模型」）。
+
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 使用场景
+      description: 你在做什么的时候感到缺了什么？现在的替代做法是什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的行为
+      description: 界面/接口层面你希望看到什么结果，而不是希望怎么实现。
+    validations:
+      required: true
+
+  - type: textarea
+    id: host-api
+    attributes:
+      label: 需要哪个宿主能力
+      description: 如果依赖 DSH 的某个服务/API（`agents`、`agentPresets`、`workspaceRegistry`、压缩后端等），请写明包名与最低版本；不确定可以写「未知」。
+      placeholder: 例：@deepseek-ai/dsh-compaction-basic 的 summarize 钩子，DSH >= 0.2.2-rc.1
+
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: 你打算自己提 PR 吗
+      options:
+        - 会提 PR
+        - 可以提 PR，但需要先讨论方案
+        - 只是建议，暂不实现
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 这个建议不包含需要挂载 shell / 文件系统工具到扮演会话的需求（那样会使恶意角色卡变成任意命令执行）

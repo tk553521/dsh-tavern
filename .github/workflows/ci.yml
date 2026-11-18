@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+
+      # `prepare` is `npm run build`, and the build is run explicitly below, so
+      # install scripts stay off and the log stays readable.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - name: Assert the bundles stay host-independent
+        run: node scripts/ci/check-host-bundle.mjs
+
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      # Everything that does not need a local `@deepseek-ai` tree: build, the five
+      # assertion suites that only touch this repo's own sources, the regression
+      # tests, and the module-boundary guard. `npm run verify` additionally runs
+      # the two suites that import host packages (seed, plugin lifecycle) and is
+      # what a maintainer runs before tagging a release.
+      - name: Build and run the host-free suites
+        run: npm run verify:ci
