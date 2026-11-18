@@ -12,11 +12,11 @@ function deferred() {
 const play = { id: 'play-a', sessionId: 'director-a', title: 'Test', characterIds: ['char-a'],
   multiAgent: true, narratorEnabled: false, createdAt: '2026-01-01', updatedAt: '2026-01-01' }
 const character = { id: 'char-a', card: normalizeCard({ name: 'Alice' }), createdAt: '', updatedAt: '' }
-function fixture(create, ensurePreset = async () => {}) {
+function fixture(create, ensurePreset = async () => {}, sessionIO = {}) {
   const handles = []
   const runtime = new TavernSessionRuntime({
-    storage: { listPlays: () => [play], getCharacter: () => character, getPreset: () => undefined, getLorebook: () => undefined },
-    agents: { create: async options => {
+    storage: { getPlay: () => play, listPlays: () => [play], getCharacter: () => character, getPreset: () => undefined, getLorebook: () => undefined },
+    agents: { resume: sessionIO.resume, create: async options => {
       const handle = create ? await create(options) : {
         agent: { id: options.sessionId, session: { snapshotEvents: () => [] } },
         disposals: 0, async dispose() { this.disposals++ },
@@ -25,7 +25,7 @@ function fixture(create, ensurePreset = async () => {}) {
       return handle
     } },
     agentPresets: {}, ensurePreset, workspace: () => undefined,
-    sessionPersistence: { open: async () => { const error = new Error('missing'); error.name = 'SessionPersistenceNotFoundError'; throw error } },
+    sessionPersistence: { open: sessionIO.open ?? (async () => { const error = new Error('missing'); error.name = 'SessionPersistenceNotFoundError'; throw error }) },
     defaultModel: () => ({ provider: 'p', model: 'm' }),
     config: normalizeConfig({}), logger: { warn() {}, error() {}, info() {} },
   })
@@ -144,3 +144,75 @@ for (const mode of ['no-reply', 'error']) {
     }
   })
 }
+
+for (const kind of ['director', 'character']) {
+  for (const phase of ['open', 'read', 'resume']) {
+    test(`existing ${kind} fails closed when session ${phase} fails`, async () => {
+      const failure = new Error('session ' + phase + ' failed')
+      let opens = 0, closes = 0, resumes = 0
+      const { runtime, handles } = fixture(undefined, undefined, {
+        async open(_id, mode) {
+          assert.equal(mode, 'read')
+          opens++
+          if (phase === 'open') throw failure
+          return {
+            header: {},
+            async read() {
+              if (phase === 'read') throw failure
+              return { events: [] }
+            },
+            async close() { closes++ },
+          }
+        },
+        async resume() { resumes++; throw failure },
+      })
+      try {
+        const activate = () => kind === 'director'
+          ? runtime.ensureDirector(play)
+          : runtime.speakFor({ agent: { id: play.sessionId }, signal: new AbortController().signal }, {})
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          await assert.rejects(activate(), error => error === failure)
+          assert.equal(opens, attempt)
+          assert.equal(closes, phase === 'open' ? 0 : attempt)
+          assert.equal(resumes, phase === 'resume' ? attempt : 0)
+          assert.equal(handles.length, 0)
+        }
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  }
+}
+
+test('editing stored history preserves a read error and closes the reader', async () => {
+  const failure = new Error('damaged session history')
+  let closed = false
+  const { runtime, handles } = fixture(undefined, undefined, {
+    async open() {
+      return {
+        async read() { throw failure },
+        async close() { closed = true },
+      }
+    },
+  })
+  try {
+    await assert.rejects(runtime.editAssistant(play.id, 'message-a', 'new text'), error => error === failure)
+    assert.equal(closed, true)
+    assert.equal(handles.length, 0)
+  } finally {
+    await runtime.dispose()
+  }
+})
+
+test('editing a play without saved history still returns a caller-facing error', async () => {
+  const { runtime } = fixture()
+  try {
+    await assert.rejects(runtime.editAssistant(play.id, 'message-a', 'new text'), {
+      name: 'TavernUserError',
+      status: 400,
+      message: /还没有可用的对话记录/,
+    })
+  } finally {
+    await runtime.dispose()
+  }
+})

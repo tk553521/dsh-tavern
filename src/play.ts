@@ -429,24 +429,11 @@ export class TavernSessionRuntime {
     }
     let handle: AgentHandle
     if (persisted.exists) {
-      try {
-        handle = await this.deps.agents.resume({
-          resumeSessionId: sessionId,
-          agentOptions,
-          setup,
-        })
-      } catch (error: unknown) {
-        this.deps.logger.warn(`tavern: resume director failed (${String(error)}); creating fresh session`)
-        handle = await this.deps.agents.create({
-          sessionId,
-          agentOptions,
-          meta: { agentPreset: persisted.preset },
-          setup,
-          ...(play.greeting !== undefined && play.greeting !== ''
-            ? { seed: greetingSeed(play.greeting, model.provider ?? 'default', model.model ?? 'default') }
-            : {}),
-        })
-      }
+      handle = await this.deps.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions,
+        setup,
+      })
     } else {
       // A swipe fork supplies the rebased history verbatim; a brand-new play
       // falls back to its greeting seed.
@@ -501,30 +488,16 @@ export class TavernSessionRuntime {
       // ownership, so it works while the host holds this session for write.
       handle = await this.deps.sessionPersistence.open(sessionId, 'read')
     } catch (error: unknown) {
-      // Only "not found" means "this play has never run". Anything else
-      // (unreadable format, corruption, a backend problem) still describes a
-      // session that exists on disk, so the caller must attempt a resume
-      // rather than a create.
+      // Only a missing session can start fresh. Let storage errors reach the
+      // caller before assembly so an unreadable log is never recreated.
       if ((error as Error | undefined)?.name === 'SessionPersistenceNotFoundError') {
         return { exists: false, preset: undefined }
       }
-      this.deps.logger.error(
-        'tavern: cannot open stored session "%s" (%s); assuming it exists',
-        String(sessionId),
-        String(error),
-      )
-      return { exists: true, preset: undefined }
+      throw error
     }
     try {
       const { events } = await handle.read()
       return { exists: true, preset: this.recordedPreset(handle.header, events) }
-    } catch (error: unknown) {
-      this.deps.logger.error(
-        'tavern: cannot read stored session "%s" (%s); assuming it exists',
-        String(sessionId),
-        String(error),
-      )
-      return { exists: true, preset: undefined }
     } finally {
       await handle.close().catch(() => {})
     }
@@ -908,31 +881,18 @@ export class TavernSessionRuntime {
       ...(model.model === undefined ? {} : { model: model.model }),
       ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),
     }
-    let handle: AgentHandle
-    if (persisted.exists) {
-      try {
-        handle = await this.deps.agents.resume({
-          resumeSessionId: sessionId,
-          agentOptions,
-          setup,
-        })
-      } catch (error: unknown) {
-        this.deps.logger.warn(`tavern: resume character failed (${String(error)}); creating fresh session`)
-        handle = await this.deps.agents.create({
-          sessionId,
-          agentOptions,
-          meta: { agentPreset: persisted.preset },
-          setup,
-        })
-      }
-    } else {
-      handle = await this.deps.agents.create({
+    const handle = persisted.exists
+      ? await this.deps.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions,
+        setup,
+      })
+      : await this.deps.agents.create({
         sessionId,
         agentOptions,
         meta: { agentPreset: TAVERN_PRESET_ID },
         setup,
       })
-    }
     return this.completeAssembly(play.id, epoch, handle, sessionId, () => {
       let byPlay = this.roles.get(play.id)
       if (byPlay === undefined) {
@@ -992,21 +952,21 @@ export class TavernSessionRuntime {
       }
       return [...handle.agent.session.snapshotEvents()]
     }
+    let stored
     try {
       // A stored session is read through a handle in 0.2; `inspect()` is gone.
-      const stored = await this.deps.sessionPersistence.open(play.sessionId as SessionId, 'read')
-      try {
-        const { events } = await stored.read()
-        return [...events]
-      } finally {
-        await stored.close().catch(() => {})
-      }
+      stored = await this.deps.sessionPersistence.open(play.sessionId as SessionId, 'read')
     } catch (error: unknown) {
-      // A play whose session was never persisted (created but never spoken to)
-      // has nothing to inspect. That is a caller-visible state, not a server
-      // fault — surfacing it as a 500 told the user nothing.
-      this.deps.logger.warn(`tavern: inspect session "${play.sessionId}" failed: ${String(error)}`)
-      throw badRequest('这场扮演还没有可用的对话记录，请先发送一条消息')
+      if ((error as Error | undefined)?.name === 'SessionPersistenceNotFoundError') {
+        throw badRequest('这场扮演还没有可用的对话记录，请先发送一条消息')
+      }
+      throw error
+    }
+    try {
+      const { events } = await stored.read()
+      return [...events]
+    } finally {
+      await stored.close().catch(() => {})
     }
   }
 
