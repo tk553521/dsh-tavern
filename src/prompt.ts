@@ -184,7 +184,7 @@ export function buildClassicSystem(
     // Classic mode used to drop post_history_instructions entirely, so the
     // same card behaved differently here than in multi-agent mode.
     const postHistory = stripPromptVariables(data.post_history_instructions).trim()
-    if (postHistory !== '') parts.push(fence.wrap(`扮演补充规则（${data.name} 角色卡自带）：\n${postHistory}`))
+    if (postHistory !== '') parts.push(fence.wrap(`扮演补充规则（${stripPromptVariables(data.name)} 角色卡自带）：\n${postHistory}`))
   }
   const safeLoreText = stripPromptVariables(loreText)
   if (safeLoreText !== '') parts.push(fence.wrap(safeLoreText))

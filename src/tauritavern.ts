@@ -704,8 +704,15 @@ export async function importTauriTavernData(
       source => importedSources.has(normalizeSource(importSource(ctx.userDir, source))),
       record => legacyCards.has(`${normalizeSource(record.source!.split('/').slice(2).join('/'))}\u0000${JSON.stringify(record.card)}`),
     )
-    await storage.appendCharacters(records)
-    report.imported.characters = records.length
+    for (const record of records) {
+      try {
+        await storage.upsertCharacter(record)
+        report.imported.characters += 1
+      } catch (error: unknown) {
+        ctx.logger.warn('tavern import: character persistence failed: %s', String(error))
+        issues.push({ category: 'character', file: record.source?.split('/').slice(2).join('/') ?? record.id, reason: '保存失败，未计入成功数量；可重试导入' })
+      }
+    }
   }
 
   if (categories.lorebooks) {
@@ -713,14 +720,28 @@ export async function importTauriTavernData(
       db.lorebooks,
       await importLorebooks(ctx, path.join(resolved.userDir, 'worlds')),
     )
-    await storage.appendLorebooks(records)
-    report.imported.lorebooks = records.length
+    for (const record of records) {
+      try {
+        await storage.upsertLorebook(record)
+        report.imported.lorebooks += 1
+      } catch (error: unknown) {
+        ctx.logger.warn('tavern import: world-book persistence failed: %s', String(error))
+        issues.push({ category: 'lorebook', file: record.source?.split('/').slice(2).join('/') ?? record.id, reason: '保存失败，未计入成功数量；可重试导入' })
+      }
+    }
   }
 
   if (categories.presets) {
     const records = dedupePresets(db.presets, await importPresets(ctx))
-    await storage.appendPresets(records)
-    report.imported.presets = records.length
+    for (const record of records) {
+      try {
+        await storage.upsertPreset(record)
+        report.imported.presets += 1
+      } catch (error: unknown) {
+        ctx.logger.warn('tavern import: preset persistence failed: %s', String(error))
+        issues.push({ category: 'preset', file: record.source?.split('/').slice(2).join('/') ?? record.id, reason: '保存失败，未计入成功数量；可重试导入' })
+      }
+    }
   }
 
   return report

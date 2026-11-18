@@ -201,7 +201,7 @@ function normalizeEntry(raw: Record<string, unknown>, uid: number): WorldBookEnt
   entry.vectorized = bool(pick('vectorized', 'vectorized'), false)
   entry.selective = bool(raw.selective, true)
   entry.selectiveLogic = num(pick('selectiveLogic', 'selectiveLogic'), 0)
-  entry.addMemo = bool(raw.addMemo, false)
+  entry.addMemo = bool(pick('addMemo', 'addMemo'), false)
   entry.order = num(raw.order, 100)
   entry.position = num(pick('position', 'position'), 0)
   entry.disable = bool(raw.disable, false)
@@ -232,7 +232,8 @@ function normalizeEntry(raw: Record<string, unknown>, uid: number): WorldBookEnt
   entry.cooldown = nullableNum(pick('cooldown', 'cooldown'))
   entry.delay = nullableNum(pick('delay', 'delay'))
   entry.triggers = strArray(pick('triggers', 'triggers'))
-  entry.keyregex = typeof raw.keyregex === 'string' ? raw.keyregex : undefined
+  const keyregex = pick('keyregex', 'keyregex')
+  entry.keyregex = typeof keyregex === 'string' ? keyregex : undefined
   // Keep the extension block for round-trip fidelity.
   entry.extensions = { ...ext }
   return entry
@@ -545,7 +546,9 @@ function serializeCharacterBookEntry(entry: WorldBookEntry): Record<string, unkn
     comment: entry.comment,
     constant: entry.constant,
     selective: entry.selective,
-    extensions: entry.extensions,
+    // Mirror every canonical control into the embedded format, preserving
+    // unknown extensions but replacing stale known values.
+    extensions: { ...(serializeEntry(entry).extensions as Record<string, unknown>), keyregex: entry.keyregex, addMemo: entry.addMemo },
   }
 }
 
@@ -656,6 +659,7 @@ export function importChatJsonl(text: string, characterNames: readonly string[])
     } catch {
       continue
     }
+    if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) continue
     const name = typeof obj.name === 'string' ? obj.name : ''
     const mes = typeof obj.mes === 'string' ? obj.mes : ''
     const isUser = obj.is_user === true

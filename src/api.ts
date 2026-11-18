@@ -45,25 +45,35 @@ function readJsonBody(req: IncomingMessage, limit = 16 * 1024 * 1024): Promise<u
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let total = 0
+    let exceeded = false
     req.on('data', (chunk: Buffer) => {
+      if (exceeded) return // Drain without retaining any more bytes.
       total += chunk.length
       if (total > limit) {
-        // A plain `Error` here used to surface as `500 服务器内部错误`; an
-        // oversized body is the caller's problem and must say so.
+        exceeded = true
+        chunks.length = 0
+        // Keep the response socket alive long enough to deliver the 413.
+        // The handler closes the connection after sending that response.
         reject(new TavernUserError(`请求体超过上限（${Math.floor(limit / 1024 / 1024)} MiB）`, 413))
-        req.destroy()
         return
       }
       chunks.push(chunk)
     })
     req.on('end', () => {
+      if (exceeded) return
       try {
         const text = Buffer.concat(chunks).toString('utf8')
-        resolve(text === '' ? undefined : JSON.parse(text))
+        if (text === '') return resolve(undefined)
+        const body: unknown = JSON.parse(text)
+        if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+          throw badRequest('请求体必须是 JSON 对象')
+        }
+        resolve(body)
       } catch (error) {
         reject(error)
       }
     })
+    req.on('aborted', () => reject(badRequest('请求体传输已中断')))
     req.on('error', reject)
   })
 }
@@ -350,7 +360,7 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
             ? JSON.stringify(body.input)
             : undefined
         if (input === undefined && typeof body.card === 'object' && body.card !== null) {
-          const card = normalizeCard(body.card)
+          const card = validated('人物卡', () => normalizeCard(body.card))
           const record: CharacterRecord = {
             id: newId('char'),
             source: typeof body.source === 'string' ? body.source : 'manual',
@@ -359,15 +369,15 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
             updatedAt: nowIso(),
             card,
           }
-          const stored = await deps.avatars.materializeCharacter(record)
-          await storage.upsertCharacter(stored)
+          const stored = await deps.avatars.persistCharacter(record,
+            next => storage.upsertCharacter(next), () => storage.getCharacter(record.id))
           return sendJson(res, 201, stored)
         }
         if (input === undefined || input.trim() === '') return sendError(res, 400, '缺少卡片输入')
         const bytes = typeof body.input === 'string' && body.input.startsWith('data:')
           ? Buffer.from(body.input.split(',')[1] ?? '', 'base64')
           : Buffer.from(input, 'utf8')
-        const card = parseCardInput(bytes, typeof body.source === 'string' ? body.source : undefined)
+        const card = validated('人物卡', () => parseCardInput(bytes, typeof body.source === 'string' ? body.source : undefined))
         const avatar = avatarDataUrl(bytes)
         const record: CharacterRecord = {
           id: newId('char'),
@@ -377,8 +387,8 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
           updatedAt: nowIso(),
           card,
         }
-        const stored = await deps.avatars.materializeCharacter(record)
-        await storage.upsertCharacter(stored)
+        const stored = await deps.avatars.persistCharacter(record,
+          next => storage.upsertCharacter(next), () => storage.getCharacter(record.id))
         return sendJson(res, 201, stored)
       }
       if (seg.length === 3 && method === 'PUT') {
@@ -389,15 +399,15 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
           ? (body.data as Record<string, unknown>)
           : {}
         const data = { ...existing.card.data, ...incoming }
-        const card = normalizeCard({ spec: existing.card.spec, spec_version: existing.card.spec_version, data })
+        const card = validated('人物卡', () => normalizeCard({ spec: existing.card.spec, spec_version: existing.card.spec_version, data }))
         const updated: CharacterRecord = {
           ...existing,
           ...(typeof body?.avatar === 'string' ? { avatar: body.avatar } : {}),
           card,
           updatedAt: nowIso(),
         }
-        const stored = await deps.avatars.materializeCharacter(updated, existing)
-        await storage.upsertCharacter(stored)
+        const stored = await deps.avatars.persistCharacter(updated,
+          next => storage.upsertCharacter(next), () => storage.getCharacter(updated.id))
         return sendJson(res, 200, stored)
       }
       if (seg.length === 3 && method === 'DELETE') {
@@ -723,6 +733,10 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
     // Validation failures are the caller's problem and carry their own status
     // and a message that is safe to display. Everything else stays opaque.
     if (error instanceof TavernUserError) {
+      if (error.status === 413) {
+        res.shouldKeepAlive = false
+        res.setHeader('connection', 'close')
+      }
       return sendError(res, error.status, error.message)
     }
     if (error instanceof SyntaxError) {

@@ -73,7 +73,7 @@ test('shared avatar references become owned copies and never delete another char
     const avatars = new AvatarStore(root, logger)
     const a = await avatars.materializeCharacter({ id: 'char-a', avatar: 'data:image/png;base64,AQID' })
     const b = await avatars.materializeCharacter({ id: 'char-b', avatar: a.avatar })
-    assert.equal(b.avatar, 'tavern/avatars/char-b.png')
+    assert.match(b.avatar, /^tavern\/avatars\/char-b--[a-f0-9]{64}\.png$/)
     assert.deepEqual(await avatars.readCharacter(b), Buffer.from([1, 2, 3]))
     await avatars.removeCharacter(b)
     assert.deepEqual(await avatars.readCharacter(a), Buffer.from([1, 2, 3]))

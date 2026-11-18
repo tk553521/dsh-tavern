@@ -276,20 +276,21 @@ function matchKeys(entry: WorldBookEntry, scan: LoreScan): string[] | null {
   // A regex key is its own branch. It used to be evaluated inside the literal
   // key loop, which never ran when `key` was empty — the natural way to author
   // a regex-only entry — so those entries could never activate at all.
+  let matched: string[]
   if (typeof entry.keyregex === 'string' && entry.keyregex !== '') {
     const compiled = compileKeyRegex(entry.keyregex, entry.caseSensitive ?? false)
     if (compiled === null) return null
-    // Bound the input per pattern: a flat MAX_REGEX_SCAN is no ceiling at all
-    // once the engine backtracks exponentially.
+    // Bound input before matching; regex hits still obey secondary filters.
     const limit = regexScanLimit(compiled.source.length)
     const text = scan.text.length > limit ? scan.text.slice(-limit) : scan.text
-    return compiled.test(text) ? [entry.keyregex] : null
+    if (!compiled.test(text)) return null
+    matched = [entry.keyregex]
+  } else {
+    const primary = cleanKeys(entry.key)
+    if (primary.length === 0) return null
+    matched = primary.filter(key => literalMatches(key, scan, entry))
+    if (matched.length === 0) return null
   }
-
-  const primary = cleanKeys(entry.key)
-  if (primary.length === 0) return null
-  const matched = primary.filter(key => literalMatches(key, scan, entry))
-  if (matched.length === 0) return null
 
   // Secondary keys FILTER a primary hit; they never activate on their own.
   // Merging both lists into one OR set (the previous behaviour) both
@@ -436,7 +437,9 @@ function entryOrder(entry: WorldBookEntry): number {
 function compareRenderOrder(a: Candidate, b: Candidate): number {
   const orderA = entryOrder(a.entry)
   const orderB = entryOrder(b.entry)
-  return orderA === orderB ? a.index - b.index : orderA - orderB
+  if (orderA !== orderB) return orderA - orderB
+  if (a.bookIndex !== b.bookIndex) return a.bookIndex - b.bookIndex
+  return a.index - b.index
 }
 
 /** Admission priority: descending `order`, then book order, then entry order. */

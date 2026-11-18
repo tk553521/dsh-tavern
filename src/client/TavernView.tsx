@@ -16,6 +16,7 @@ import type { ChatSnapshot } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { IConversation } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { PlaySummary, SwipeBranchSummary, TavernState, TavernStyle } from '../types.ts'
 import { tavernApi, type TavernApi } from './api.ts'
+import { createLatestRequest } from './latest-request.ts'
 import type { createTavernStore } from './store.ts'
 import { ChatPanel } from './components/ChatPanel.tsx'
 import { CharacterPanel } from './components/CharacterPanel.tsx'
@@ -288,18 +289,19 @@ export function TavernView({
   // Style preference: optimistic local state, seeded from the server snapshot.
   const [style, setStyle] = useState<TavernStyle>('dsh')
 
-  const refresh = useCallback(async (): Promise<void> => {
-    const next = await loadState(tavernApi)
-    setState(next)
-    setLoading(false)
-  }, [])
+  const refreshRequests = useMemo(() => createLatestRequest(
+    () => loadState(tavernApi),
+    next => { setState(next); setLoading(false) },
+  ), [])
+  const refresh = useCallback((): Promise<void> => refreshRequests.run(), [refreshRequests])
 
   useEffect(() => {
     void refresh().catch(e => {
       actions.setError(e instanceof Error ? e.message : String(e))
       setLoading(false)
     })
-  }, [refresh, actions])
+    return () => refreshRequests.invalidate()
+  }, [refresh, refreshRequests, actions])
 
   // Adopt the persisted style once the state snapshot arrives.
   useEffect(() => {

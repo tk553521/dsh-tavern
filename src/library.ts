@@ -204,15 +204,18 @@ export class LibraryStore {
     return this.put('characters', record.id, record)
   }
 
-  /** Write many records; a failure on one is reported but does not abort the rest. */
+  /** Try every record, then propagate failures instead of reporting false success. */
   async putCharacters(records: readonly CharacterRecord[]): Promise<void> {
+    const failures: unknown[] = []
     for (const record of records) {
       try {
         await this.putCharacter(record)
       } catch (error: unknown) {
+        failures.push(error)
         this.logger.warn(`tavern library: cannot store character ${record.id}: ${String(error)}`)
       }
     }
+    if (failures.length > 0) throw new AggregateError(failures, `Failed to persist ${failures.length} character record(s)`)
   }
 
   dropCharacter(id: string): Promise<void> {

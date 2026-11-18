@@ -8,7 +8,7 @@ SillyTavern / TauriTavern 风格的角色扮演插件，作为 DeepSeek Harness 
 在 Web 界面的「对话」「轨迹」标签右侧新增 **「酒馆」** 标签，提供**人物卡、世界书、预设**管理，
 以及遵循 DSH 范式的**多 agent 角色扮演**。
 
-宿主版本要求见 `package.json` 的 `engines.dsh`：`>=0.2.2-alpha.3 <0.3.0`。仓库自带的
+宿主版本要求见 `package.json` 的 `engines.dsh`：`>=0.2.2-rc.3 <0.3.0`。仓库自带的
 `npm run verify` 覆盖资料库、世界书、提示词、开场白与插件生命周期；`npm run verify:ci` 是它的
 免宿主子集（不需要链接 `@deepseek-ai`），每个 PR 的 CI 都跑这一份。宿主实机上的完整扮演链路
 （会话恢复、世界书注入、重试/Swipe）以目标 DSH 版本的实际运行为准。
@@ -71,6 +71,16 @@ SillyTavern / TauriTavern 风格的角色扮演插件，作为 DeepSeek Harness 
 - **析构是异步的**：插件卸载会 `await` 每个 director / 角色 agent 真正释放，而不是 fire-and-forget。
 - **日志级别**：cordis 的 `LoggerLevel` 是 `ERROR=0, WARN=1, INFO=2, DEBUG=3`，过滤条件为 `targetLevel < level` 时跳过，默认阈值 `INFO`——也就是说 **`WARN` 默认会输出，`DEBUG` 被丢弃**。用户需要看见的失败用 `.error`，可降级的失败用 `.warn`。
 
+### 0.1.1 / DSH 0.2.2-rc.3
+
+本版以 `0.2.2-rc.3` 为最低宿主版本，保留旧资料库与旧头像路径读取；没有写入用户 profile 的升级脚本。详见 [CHANGELOG.md](CHANGELOG.md)。
+
+- 已对当前宿主运行时核对 `agents` 的 `create/resume` 与 `reasoningEffort` 契约，并通过真实 Cordis / Session 基础类测试。
+- 已确认 rc.3 Web 构建中的平台模块表包含 `@deepseek-ai/dsh-client-store`；构建时明确将它外置，不再依赖 unresolved-import 回退。
+- 批量导入按每条记录的实际落盘结果计数，失败显示固定 issue 并可重新导入，不再将写盘失败记作成功。
+- 升级指南已检查 Chat activity 的 `context` 变更与归档工作树清理：酒馆没有 activity 的穷尽映射，也不创建工作树；其他账号、Forge、Office、CUA 等变更不触及本插件。
+- 验证覆盖构建、类型、HTTP、资料库与 agent 契约替身；真实模型生成、GUI 端到端和 profile 热更新仍应在目标部署验证。
+
 ### 插件配置
 
 `cordis.patch.yml` 的 bundle patch 会插入插件行，需要调参时在这行上加 `config:`（cordis 会用插件导出的 `Config` schema 校验）：
@@ -90,7 +100,7 @@ SillyTavern / TauriTavern 风格的角色扮演插件，作为 DeepSeek Harness 
 
 ## 安装
 
-先决条件：Node ≥ 22（构建）；`pnpm` 在 PATH 上（`dsh plugin` 会把参数转发给 profile 目录里的 pnpm，找不到时以 127 退出）；运行中的 dsh 满足 `engines.dsh`，低于 `0.2.2-alpha.3` 会在安装/启用时报版本不兼容。
+先决条件：Node ≥ 22（构建）；`pnpm` 在 PATH 上（`dsh plugin` 会把参数转发给 profile 目录里的 pnpm，找不到时以 127 退出）；运行中的 dsh 满足 `engines.dsh`，低于 `0.2.2-rc.3` 会在安装/启用时报版本不兼容。
 
 `@deepseek-ai/*` **不在 npm registry 上**，构建与类型检查需要本机 dsh 安装里的那份 `@deepseek-ai`。先在仓库根目录建一个链接。目录因安装方式而异：桌面版通常是 `%APPDATA%\dsh-tauri\dependencies\dsh\node_modules\@deepseek-ai`，npm 安装是 `<dsh 安装根>\node_modules\@deepseek-ai`；目录里应能看到 `dsh`、`cordis`、`dsh-session` 等包。
 
@@ -149,7 +159,7 @@ dsh plugin --profile web add .
 ## 数据格式兼容
 
 - 人物卡：`chara_card_v2`（默认导出）；读取兼容 v1/v2/v3 与 PNG 嵌入（`ccv3` 优先、`chara` 回退、Base64 值）。
-- 头像：记录里的 `avatar` 字段保存 `tavern/avatars/<character-id>.<ext>` 相对路径（PNG / JPEG / WebP / GIF 都接受），文件本体位于 `$DSH_HOME/tavern/avatars/`；旧版 base64 内联头像会在插件启动时自动迁移为文件。
+- 头像：新记录里的 `avatar` 字段保存 `tavern/avatars/<character-id>--<sha256>.<ext>` 相对路径（PNG / JPEG / WebP / GIF 都接受）。旧版 `<character-id>.<ext>` 路径仍可读取。更新先写不可变的新图，再提交人物卡 JSON，成功后清理旧图；失败保留原记录与原图。文件本体位于 `$DSH_HOME/tavern/avatars/`；旧版 base64 内联头像仍在启动时迁移。暂存与崩溃可能留下未引用图片，本版不自动扫描删除这些孤立文件。
 - 世界书：ST 独立世界书（`entries` 为 uid 键对象）与内嵌 `character_book`（entries 数组）均可导入；导出为 ST 世界书文件格式（snake_case `extensions` 元数据镜像）。
 - 预设：ST 各类型预设 JSON 均接受；`custom_model` 映射为 DSH 模型路由。
 - 聊天：对话完全以 DSH 会话日志为准（可用标准导出能力），资料库只在 `tavern/library/` 存剧本绑定。
@@ -162,8 +172,8 @@ dsh plugin --profile web add .
 - `npm run build` / `npx tsdown`：产出 `lib/index.js`（宿主半，ESM）与 `lib/client.js`（浏览器半，CJS 闭包交给宿主的模块加载器；平台模块从宿主模块表解析）。`lib/` 是构建产物，**不提交进仓库**。
 - `npm run dev:sync`：构建后再把 `lib/` 同步进 `$DSH_HOME/profiles/<profile>/node_modules/dsh-tavern/`（`dsh web` 实际加载的那份快照）。这一步会写项目之外的目录，所以**不放在 `prepare` 里**——`npm install` 不应产生项目外副作用。
 - `npm run typecheck`：宿主与客户端两个独立 TypeScript 程序（避免宿主/客户端 Context 声明合并冲突）；当前工作树两者都是 0 error。
-- `npm run verify`：先构建，再跑 `scripts/verify/` 下的五个断言脚本（资料库、世界书激活语义、提示词围栏、开场白 seed、cordis 插件生命周期），基础断言 **103** 项（19 + 38 + 15 + 8 + 23），再执行 **16** 项回归测试，共 **119** 项。生命周期那一份会在**真实的 cordis root context** 里加载构建产物，用 0.2.2 的服务契约替身断言就绪门控、路由挂载/摘除、可选依赖与配置校验，并用宿主自己的 `entryListProblem` 校验预设声明；seed 那一份把 `greetingSeed()` 交给宿主的 `Session.create` 校验。验证脚本直接用 Node 执行 `.ts`，需要 Node ≥ 23.6（或 22.18+ 的默认类型擦除），并且同样需要「安装」一节里的 `@deepseek-ai` 链接（seed/plugin 脚本会直接 import 宿主包）。
-- `npm run verify:regressions`：独立运行数据并发/删除、头像所有权、跨目录导入、预设清空导出、环境配置、世界书 HTTP 保存与运行时生命周期/回复边界的 16 项回归测试。数据测试使用隔离临时目录；运行时测试通过公共接口搭配 agent 服务替身，不调用真实模型。头像与 HTTP 测试需要 `--experimental-transform-types`（脚本已包含），以支持 TypeScript 参数属性；完整验证仍建议使用 Node 22.18+ 或 24。
+- `npm run verify`：先构建，再跑 `scripts/verify/` 下的五个断言脚本（资料库、世界书激活语义、提示词围栏、开场白 seed、cordis 插件生命周期），基础断言覆盖资料库、世界书、提示词、seed 与插件生命周期，随后执行原有 **16** 项与新增审计 **23** 项回归测试。生命周期那一份会在**真实的 cordis root context** 里加载构建产物，用 0.2.2 的服务契约替身断言就绪门控、路由挂载/摘除、可选依赖与配置校验，并用宿主自己的 `entryListProblem` 校验预设声明；seed 那一份把 `greetingSeed()` 交给宿主的 `Session.create` 校验。验证脚本直接用 Node 执行 `.ts`，需要 Node ≥ 23.6（或 22.18+ 的默认类型擦除），并且同样需要「安装」一节里的 `@deepseek-ai` 链接（seed/plugin 脚本会直接 import 宿主包）。
+- `npm run verify:regressions`：独立运行数据并发/删除、头像所有权、跨目录导入、预设清空导出、环境配置、世界书 HTTP 保存与运行时生命周期/回复边界的 39 项回归测试（原有 16 项 + 审计修复 23 项）。新增覆盖正则二级条件、多书排序、宏处理、内嵌世界书往返、导入落盘错误、JSONL 非对象、推理强度、响应乱序与头像提交失败/并发一致性。数据测试使用隔离临时目录；运行时测试通过公共接口搭配 agent 服务替身，不调用真实模型。头像与 HTTP 测试需要 `--experimental-transform-types`（脚本已包含），以支持 TypeScript 参数属性；完整验证仍建议使用 Node 22.18+ 或 24。
 - 类型解析：`@deepseek-ai/*` 通过 `node_modules/@deepseek-ai` 解析（链接方法见「安装」）；三个 tsconfig 都不含绝对路径或 `.ref/` 引用。
 - 宿主半没有运行时 `@deepseek-ai` 导入（`import type` 在转译期擦除）；浏览器半通过宿主模块表加载平台模块。这两条不变式由 `scripts/ci/check-host-bundle.mjs` 在 CI 里拦。
 - `npm run verify:ci`：`verify` 的免宿主子集（资料库 + 世界书 + 提示词 + 全部回归测试 + 产物模块边界检查），不需要「安装」一节里的 `@deepseek-ai` 链接，CI 的 `verify` 检查跑的就是它。

@@ -17,6 +17,7 @@ const EXTERNALS: readonly string[] = [
   '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-client-runtime/client',
   '@deepseek-ai/dsh-client-ui-slots',
+  '@deepseek-ai/dsh-client-store',
   '@deepseek-ai/dsh-client-locale',
   '@deepseek-ai/dsh-client-ui-conversation',
 ]
@@ -41,7 +42,7 @@ const node: UserConfig = {
   fixedExtension: false,
   // The host plugin's runtime deps come from the DSH process itself; nothing
   // under @deepseek-ai is bundled (type-only imports erase at transpile).
-  external: [/^@deepseek-ai\//],
+  deps: { neverBundle: [/^@deepseek-ai\//] },
 }
 
 const client: UserConfig = {
@@ -55,7 +56,7 @@ const client: UserConfig = {
   sourcemap: true,
   // See the `clean` note on the node config: this must stay false.
   clean: false,
-  external: EXTERNALS,
+  deps: { neverBundle: EXTERNALS },
   define: {
     'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'production'),
     'import.meta.env.MODE': JSON.stringify(process.env.NODE_ENV ?? 'production'),

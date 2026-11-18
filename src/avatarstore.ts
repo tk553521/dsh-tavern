@@ -8,6 +8,7 @@
 
 import { mkdir, readFile, rm } from 'node:fs/promises'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import type { LoggerService } from '@deepseek-ai/cordis'
 import type { CharacterRecord } from './types.ts'
 import { writeAtomic } from './atomic.ts'
@@ -77,7 +78,9 @@ function fileFromAvatar(avatar: string | undefined): string | undefined {
 
 /** Files are owned by the record whose id is their filename stem. */
 function ownsFile(id: string, file: string): boolean {
-  return file.slice(0, file.lastIndexOf('.')) === id
+  const stem = file.slice(0, file.lastIndexOf('.'))
+  if (stem === id) return true // Legacy unversioned avatar.
+  return stem.startsWith(`${id}--`) && /^[a-f0-9]{64}$/.test(stem.slice(id.length + 2))
 }
 
 /** Options for {@link AvatarStore.materializeCharacter}. */
@@ -139,9 +142,9 @@ export class AvatarStore {
    * limit on what a client can put in `avatar`, and whatever lands in the
    * settings document is re-serialized on every later library mutation.
    *
-   * Writes are serialized per character and go through {@link writeAtomic}, so
-   * two saves of the same record (two tabs, double click, import-then-edit)
-   * cannot overwrite each other half-way or delete each other's file.
+   * Staging writes use immutable content-addressed filenames and writeAtomic.
+   * Call persistCharacter for an update: it serializes staging, durable JSON
+   * publication and old-file retirement as one per-character operation.
    */
   async materializeCharacter(
     record: CharacterRecord,
@@ -182,22 +185,51 @@ export class AvatarStore {
       return withoutAvatar(record)
     }
 
-    const file = safeFile(record.id, decoded.extension)
+    const digest = createHash('sha256').update(decoded.bytes).digest('hex')
+    const file = safeFile(`${record.id}--${digest}`, decoded.extension)
     if (file === undefined) {
       this.logger.warn('tavern avatar: character id %s is not filename-safe; leaving avatar inline', record.id)
       return record
     }
 
+    // Materialization is staging only. Content-addressed files are immutable:
+    // it must neither replace nor delete an image referenced by durable JSON.
+    await this.ensureRoot()
+    await writeAtomic(this.filePath(file), decoded.bytes)
+    return { ...record, avatar: relativeAvatar(file) }
+  }
+
+  /** Stage an immutable image, commit JSON, then retire the previous image.
+   * The entire operation is serialized per character, including publication.
+   * `current` is read inside the queue so concurrent requests cannot roll back
+   * or remove another request's committed image.
+   */
+  async persistCharacter(
+    record: CharacterRecord,
+    persist: (next: CharacterRecord) => Promise<void>,
+    current: () => CharacterRecord | undefined,
+    options: MaterializeAvatarOptions = {},
+  ): Promise<CharacterRecord> {
     return this.serialize(record.id, async () => {
-      await this.ensureRoot()
-      // The image bytes go through the same per-path writer as the JSON
-      // records: that is what serializes concurrent writers and retries the
-      // Windows EPERM case. `writeAtomic` accepts raw bytes, so nothing is
-      // re-encoded on the way (any string round trip would corrupt every byte
-      // above 0x7f).
-      await writeAtomic(this.filePath(file), decoded.bytes)
-      await this.removePrevious(file, previous)
-      return { ...record, avatar: relativeAvatar(file) }
+      const previous = current()
+      const next = await this.materializeCharacter(record, previous, options)
+      try {
+        await persist(next)
+      } catch (error: unknown) {
+        // Only a newly staged version is disposable. Never delete a file
+        // referenced by the current committed record or an incoming old path.
+        if (next.avatar !== previous?.avatar && next.avatar !== record.avatar) {
+          const file = fileFromAvatar(next.avatar)
+          if (file !== undefined && ownsFile(record.id, file)) {
+            await rm(this.filePath(file), { force: true }).catch(() => void 0)
+          }
+        }
+        throw error
+      }
+      if (next.avatar !== previous?.avatar) {
+        await this.removePrevious(fileFromAvatar(next.avatar), previous)
+      }
+      return next
     })
   }
 
@@ -211,11 +243,11 @@ export class AvatarStore {
    * behind on purpose: a stray byte costs nothing, a missing avatar does not
    * come back.
    */
-  private async removePrevious(current: string, previous?: CharacterRecord): Promise<void> {
+  private async removePrevious(current: string | undefined, previous?: CharacterRecord): Promise<void> {
     const previousFile = previous !== undefined ? fileFromAvatar(previous.avatar) : undefined
     if (previousFile === undefined || previous === undefined
-      || !ownsFile(previous.id, previousFile) || !ownsFile(previous.id, current)
-      || previousFile.toLowerCase() === current.toLowerCase()) return
+      || !ownsFile(previous.id, previousFile)
+      || (current !== undefined && (!ownsFile(previous.id, current) || previousFile.toLowerCase() === current.toLowerCase()))) return
     await rm(this.filePath(previousFile), { force: true }).catch(() => void 0)
   }
 

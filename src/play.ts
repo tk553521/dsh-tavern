@@ -19,7 +19,7 @@ import { createHash } from 'node:crypto'
 import type { LoggerService } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AgentRegistry, AgentSetup } from '@deepseek-ai/dsh-agent'
 import type { AgentPresetRegistry } from '@deepseek-ai/dsh-agent-preset-registry'
-import type { MessageId, UserMessage } from '@deepseek-ai/dsh-llm'
+import type { MessageId, UserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, SessionHeader, SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import type SessionPersistence from '@deepseek-ai/dsh-session-persistence'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
@@ -426,6 +426,7 @@ export class TavernSessionRuntime {
       ...(model.provider === undefined ? {} : { provider: model.provider }),
       ...(model.model === undefined ? {} : { model: model.model }),
       ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),
+      ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: model.reasoningEffort as ReasoningEffortId }),
     }
     let handle: AgentHandle
     if (persisted.exists) {
@@ -907,6 +908,7 @@ export class TavernSessionRuntime {
       ...(model.provider === undefined ? {} : { provider: model.provider }),
       ...(model.model === undefined ? {} : { model: model.model }),
       ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),
+      ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: model.reasoningEffort as ReasoningEffortId }),
     }
     let handle: AgentHandle
     if (persisted.exists) {
