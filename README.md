@@ -165,15 +165,16 @@ dsh plugin --profile web add .
 - 聊天：对话完全以 DSH 会话日志为准（可用标准导出能力），资料库只在 `tavern/library/` 存剧本绑定。
 - 偏好：`defaultPresetId`、`style` 在 `$DSH_HOME/tavern/prefs.json`；旧版把资料库放在 settings 文档里的安装，启动时会尝试从 `$DSH_HOME/tavern/legacy-library.json` 或 `settings.yaml.imported` / `settings.yaml` 的 `tavern:` 段恢复。读 YAML 需要可用的 `yaml` 模块，缺它时只打印一条指引，不改原文件。
 - 本地数据目录：接受 TauriTavern 安装根目录（自动查找 `data/default-user`）、data 根目录、`default-user` 目录或其子目录；如存在 `tauritavern-runtime.json`，会参考其中配置的 `data_root`。按规范化真实数据根目录的 SHA-256 命名空间与相对源文件路径去重，可重复执行；不同安装目录下的同名文件独立导入。旧版无命名空间记录只在内容一致时去重；不会修改原目录。
-  > 已知限制：`data_root` 目前只在**位于安装根目录之内**时生效；写成绝对路径或 `..` 跳出安装根会被忽略，此时请直接把那个目录作为导入路径填进来。
+  > 目录边界：`data_root` 解析后的路径及其真实路径须位于检测到的安装根内，根内绝对路径也可接受；词法越界沿用忽略并报告行为，内部软链接 / junction 改向到根外则直接报错。外置数据目录请直接作为导入路径选择。
 
 ## 开发与构建
 
 - `npm run build` / `npx tsdown`：产出 `lib/index.js`（宿主半，ESM）与 `lib/client.js`（浏览器半，CJS 闭包交给宿主的模块加载器；平台模块从宿主模块表解析）。`lib/` 是构建产物，**不提交进仓库**。
 - `npm run dev:sync`：构建后再把 `lib/` 同步进 `$DSH_HOME/profiles/<profile>/node_modules/dsh-tavern/`（`dsh web` 实际加载的那份快照）。这一步会写项目之外的目录，所以**不放在 `prepare` 里**——`npm install` 不应产生项目外副作用。
 - `npm run typecheck`：宿主与客户端两个独立 TypeScript 程序（避免宿主/客户端 Context 声明合并冲突）；当前工作树两者都是 0 error。
-- `npm run verify`：先构建，再跑 `scripts/verify/` 下的五个断言脚本（资料库、世界书激活语义、提示词围栏、开场白 seed、cordis 插件生命周期），基础断言覆盖资料库、世界书、提示词、seed 与插件生命周期，随后执行原有 **16** 项与新增审计 **23** 项回归测试。生命周期那一份会在**真实的 cordis root context** 里加载构建产物，用 0.2.2 的服务契约替身断言就绪门控、路由挂载/摘除、可选依赖与配置校验，并用宿主自己的 `entryListProblem` 校验预设声明；seed 那一份把 `greetingSeed()` 交给宿主的 `Session.create` 校验。验证脚本直接用 Node 执行 `.ts`，需要 Node ≥ 23.6（或 22.18+ 的默认类型擦除），并且同样需要「安装」一节里的 `@deepseek-ai` 链接（seed/plugin 脚本会直接 import 宿主包）。
-- `npm run verify:regressions`：独立运行数据并发/删除、头像所有权、跨目录导入、预设清空导出、环境配置、世界书 HTTP 保存与运行时生命周期/回复边界的 39 项回归测试（原有 16 项 + 审计修复 23 项）。新增覆盖正则二级条件、多书排序、宏处理、内嵌世界书往返、导入落盘错误、JSONL 非对象、推理强度、响应乱序与头像提交失败/并发一致性。数据测试使用隔离临时目录；运行时测试通过公共接口搭配 agent 服务替身，不调用真实模型。头像与 HTTP 测试需要 `--experimental-transform-types`（脚本已包含），以支持 TypeScript 参数属性；完整验证仍建议使用 Node 22.18+ 或 24。
+- `npm run verify`：先构建，再跑 `scripts/verify/` 下的五个断言脚本（资料库、世界书激活语义、提示词围栏、开场白 seed、cordis 插件生命周期），基础断言覆盖资料库、世界书、提示词、seed 与插件生命周期，随后执行原有 **39** 项回归以及 `verify:stability` 中的稳定性回归。生命周期那一份会在**真实的 cordis root context** 里加载构建产物，用 0.2.2 的服务契约替身断言就绪门控、路由挂载/摘除、可选依赖与配置校验，并用宿主自己的 `entryListProblem` 校验预设声明；seed 那一份把 `greetingSeed()` 交给宿主的 `Session.create` 校验。验证脚本直接用 Node 执行 `.ts`，需要 Node ≥ 23.6（或 22.18+ 的默认类型擦除），并且同样需要「安装」一节里的 `@deepseek-ai` 链接（seed/plugin 脚本会直接 import 宿主包）。
+- `npm run verify:regressions`：运行原有 39 项数据、编解码、HTTP、运行时和审计回归，再运行 `verify:stability`。数据测试使用隔离临时目录；运行时测试通过公共接口搭配 agent 服务替身，不调用真实模型。头像与 HTTP 测试需要 `--experimental-transform-types`（脚本已包含），完整验证建议 Node 22.18+ 或 24。
+- `npm run verify:stability`：四组稳定性回归（恢复错误／准备后提交／分支身份、HTTP 绑定传递、五集合结构与导入目录边界、实际消息投影与客户端状态机）。覆盖失败草稿、隐藏开场 Swipe、同步输入互斥和旧格式兼容；纯客户端测试不等同于浏览器端到端。Windows APPDATA 回归在非 Windows 平台跳过。
 - 类型解析：`@deepseek-ai/*` 通过 `node_modules/@deepseek-ai` 解析（链接方法见「安装」）；三个 tsconfig 都不含绝对路径或 `.ref/` 引用。
 - 宿主半没有运行时 `@deepseek-ai` 导入（`import type` 在转译期擦除）；浏览器半通过宿主模块表加载平台模块。这两条不变式由 `scripts/ci/check-host-bundle.mjs` 在 CI 里拦。
 - `npm run verify:ci`：`verify` 的免宿主子集（资料库 + 世界书 + 提示词 + 全部回归测试 + 产物模块边界检查），不需要「安装」一节里的 `@deepseek-ai` 链接，CI 的 `verify` 检查跑的就是它。
@@ -198,6 +199,8 @@ dsh plugin --profile web add .
 - 非 PNG 头像（jpg / webp / gif）无法嵌入导出的 PNG 人物卡（需要转码）；导出会回退为空白图，并在响应头 `x-tavern-avatar: omitted-unsupported-format` 中说明。
 - 预设注册失败时，**新建剧本会失败**（创建路径会等待预设注册）；已存在会话里的预设挂载失败只记 `WARN`，会话继续以无预设运行。
 - 重试/切换（swipe）每条分支最多保留 12 次尝试，超出后最旧的会被丢弃；每次重试/编辑都会 fork 一个新 DSH 会话，旧会话日志留在磁盘上暂不回收。
+- Swipe 只作用于当前尾部且身份匹配的回复；已有后续对话、正在输出、仍有待处理输入或轮次含多条追加输入时返回 409，不隐式截断历史。隐藏开场用户仍保留所属回复身份。
+- 分叉采用准备后提交与失败回滚，不是跨文件的崩溃级事务；角色记忆的分支隔离、崩溃遗留 busy 恢复及级联删除事务仍是后续工作。坏资料会警告并从索引隔离，原文件保留供恢复。
 - 浏览器半通过宿主前端的模块表加载：构建产物只请求 `react`、`react/jsx-runtime` 与 `@deepseek-ai/dsh-client-store`（三者都是宿主平台模块表里的基线模块），其余 `@deepseek-ai/*` 引用是 type-only、转译期已擦除。宿主版本若改了模块表，需要同步 `src/client/vendor.d.ts` 与 `tsdown.config.ts` 的 external 列表。
 - 会话日志的读取用的是 `Session.snapshotEvents()` / `eventAt()`：宿主已把它们标注为 **deprecated（"new calls are prohibited"）**，但没有提供等价的一次性全量读取；将来改用 `session.surface` / `ctx.sessionQuery.readSession()` 时，`src/play.ts` 里读日志的几处（取回复文本、世界书扫描、swipe 分叉尾部）需要一起迁移。
 - `/tavern` 是本地插件路由，不构成远程访问方案；不要把 DSH web 暴露到公网。

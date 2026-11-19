@@ -12,6 +12,7 @@ import { TavernStorage, newId, nowIso } from './storage.ts'
 import { normalizeCard, parseCardInput, avatarDataUrl, normalizeWorldBook, serializeWorldBookFile, importPreset, serializePreset, serializeCharacterCard } from './cardcodec.ts'
 import { encodePngCardResult } from './png.ts'
 import { playLorebookIds, TavernSessionRuntime } from './play.ts'
+import { swipeUserMessageId } from './swipe.ts'
 import { importTauriTavernData } from './tauritavern.ts'
 import { badRequest, TavernUserError } from './errors.ts'
 import type { TavernConfig } from './config.ts'
@@ -161,6 +162,7 @@ export interface PlayCreateInput {
 
 /** Strip a stored swipe branch down to its client-facing summary. */
 function toSwipeSummary(branch: import('./types.ts').SwipeBranch): SwipeBranchSummary {
+  const userMessageId = swipeUserMessageId(branch)
   return {
     playId: branch.playId,
     key: branch.key,
@@ -168,8 +170,18 @@ function toSwipeSummary(branch: import('./types.ts').SwipeBranch): SwipeBranchSu
     current: branch.current,
     busy: branch.busy,
     updatedAt: branch.updatedAt,
+    ...(userMessageId !== undefined ? { userMessageId } : {}),
+    ...(branch.sessionId !== undefined ? { sessionId: branch.sessionId } : {}),
     ...(branch.error !== undefined ? { error: branch.error } : {}),
   }
+}
+
+/** Optional for old clients, but a supplied stale/invalid binding is never ignored. */
+function expectedSessionId(body: unknown): string | undefined {
+  const value = (body as { expectedSessionId?: unknown } | undefined)?.expectedSessionId
+  if (value === undefined) return undefined
+  if (typeof value !== 'string' || value === '') throw badRequest('expectedSessionId必须是非空字符串')
+  return value
 }
 
 const PRESET_NUMBER_KEYS = [
@@ -630,7 +642,8 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
       }
       // Retry: regenerate the last assistant reply as a new swipe variant.
       if (seg.length === 5 && seg[3] === 'messages' && seg[4] === 'retry' && method === 'POST') {
-        const result = await runtime.reroll(seg[2]!)
+        const body = await readJsonBody(req)
+        const result = await runtime.reroll(seg[2]!, expectedSessionId(body))
         return sendJson(res, 200, { play: result.play, branch: toSwipeSummary(result.branch) })
       }
       // Swipe: materialize another stored variant of the current branch.
@@ -639,21 +652,21 @@ export async function tavernHandler(deps: TavernApiDeps, req: IncomingMessage, r
         if (typeof body?.key !== 'string' || typeof body?.step !== 'number') {
           return sendError(res, 400, '需要分支 key 与移动方向 step')
         }
-        const result = await runtime.swipe(seg[2]!, body.key, body.step)
+        const result = await runtime.swipe(seg[2]!, body.key, body.step, expectedSessionId(body))
         return sendJson(res, 200, { play: result.play, branch: toSwipeSummary(result.branch) })
       }
       // Edit one user message and regenerate from it.
       if (seg.length === 6 && seg[3] === 'messages' && seg[5] === 'retry' && method === 'POST') {
         const body = (await readJsonBody(req)) as { text?: unknown } | undefined
         if (typeof body?.text !== 'string') return sendError(res, 400, '缺少修改后的内容')
-        const play = await runtime.editUserAndRetry(seg[2]!, seg[4]!, body.text)
+        const play = await runtime.editUserAndRetry(seg[2]!, seg[4]!, body.text, expectedSessionId(body))
         return sendJson(res, 200, { play })
       }
       // Edit one assistant reply in place (no regeneration).
       if (seg.length === 5 && seg[3] === 'messages' && method === 'PUT') {
         const body = (await readJsonBody(req)) as { text?: unknown } | undefined
         if (typeof body?.text !== 'string') return sendError(res, 400, '缺少修改后的内容')
-        const play = await runtime.editAssistant(seg[2]!, seg[4]!, body.text)
+        const play = await runtime.editAssistant(seg[2]!, seg[4]!, body.text, expectedSessionId(body))
         return sendJson(res, 200, { play })
       }
       // Activate (create or resume) the play's director session.

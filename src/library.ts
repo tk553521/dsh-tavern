@@ -25,6 +25,7 @@
 import { mkdir, readdir, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { writeAtomic } from './atomic.ts'
+import { isSafeLibraryId, validateLibraryRecord, type LibraryCollection } from './library-validation.ts'
 import type { CharacterRecord, Play, Preset, SwipeBranch, WorldBookRecord } from './types.ts'
 
 /** Minimal logger surface (matches the host's LoggerService shape we use). */
@@ -41,20 +42,10 @@ export interface LibraryLogger {
 
 /** The record collections held on disk, each in its own subdirectory. */
 const COLLECTIONS = ['characters', 'lorebooks', 'presets', 'plays', 'branches'] as const
-type Collection = (typeof COLLECTIONS)[number]
+type Collection = LibraryCollection
 
-/**
- * Record ids are generated (`char-<uuid>`), but they reach this module from
- * HTTP paths too, so they are validated rather than trusted: a file name is
- * built from them and `..` or a separator would escape the collection
- * directory.
- */
-const SAFE_ID = /^[A-Za-z0-9._~-]{1,128}$/
-
-/** Whether an id is safe to use as a file name. */
-function isSafeId(id: string): boolean {
-  return SAFE_ID.test(id) && id !== '.' && id !== '..'
-}
+/** Filename checks and record shapes live in the shared runtime validator. */
+const isSafeId = isSafeLibraryId
 
 /** File-name key of one swipe branch (branches are keyed by play + fork point). */
 function branchKey(playId: string, key: string): string {
@@ -152,10 +143,13 @@ export class LibraryStore {
       await Promise.all(batch.map(async (name) => {
         const key = name.slice(0, -'.json'.length)
         try {
-          map.set(key, JSON.parse(await readFile(join(dir, name), 'utf8')))
+          const value: unknown = JSON.parse(await readFile(join(dir, name), 'utf8'))
+          validateLibraryRecord(collection, value, key)
+          map.set(key, value)
         } catch (error: unknown) {
-          // Skip, do not throw: one unparseable file must not cost the user
-          // the other thousand records.
+          // Isolate malformed JSON AND malformed core records, retaining the
+          // original file for recovery instead of deleting or rewriting it.
+          map.delete(key)
           this.logger.warn(`tavern library: skipping ${collection}/${name}: ${String(error)}`)
         }
       }))
@@ -163,12 +157,16 @@ export class LibraryStore {
   }
 
   /** Persist one record and index it. */
-  private async put(collection: Collection, key: string, value: unknown): Promise<void> {
-    if (!isSafeId(key)) throw new Error(`tavern library: 非法记录 id：${key}`)
+  private async put(collection: Collection, value: unknown): Promise<void> {
+    const key = validateLibraryRecord(collection, value)
     const data = JSON.stringify(value)
+    // Snapshot what will actually be stored: caller mutation or toJSON must
+    // not publish an index value that differs from the committed JSON.
+    const persisted: unknown = JSON.parse(data)
+    validateLibraryRecord(collection, persisted, key)
     await this.enqueue(collection, key, async () => {
       await writeAtomic(join(this.root, collection, `${key}.json`), data)
-      this.maps[collection].set(key, value)
+      this.maps[collection].set(key, persisted)
     })
   }
 
@@ -201,7 +199,7 @@ export class LibraryStore {
   }
 
   putCharacter(record: CharacterRecord): Promise<void> {
-    return this.put('characters', record.id, record)
+    return this.put('characters', record)
   }
 
   /** Try every record, then propagate failures instead of reporting false success. */
@@ -212,7 +210,7 @@ export class LibraryStore {
         await this.putCharacter(record)
       } catch (error: unknown) {
         failures.push(error)
-        this.logger.warn(`tavern library: cannot store character ${record.id}: ${String(error)}`)
+        this.logger.warn(`tavern library: cannot store character ${String(record?.id)}: ${String(error)}`)
       }
     }
     if (failures.length > 0) throw new AggregateError(failures, `Failed to persist ${failures.length} character record(s)`)
@@ -233,7 +231,7 @@ export class LibraryStore {
   }
 
   putLorebook(record: WorldBookRecord): Promise<void> {
-    return this.put('lorebooks', record.id, record)
+    return this.put('lorebooks', record)
   }
 
   dropLorebook(id: string): Promise<void> {
@@ -251,7 +249,7 @@ export class LibraryStore {
   }
 
   putPreset(record: Preset): Promise<void> {
-    return this.put('presets', record.id, record)
+    return this.put('presets', record)
   }
 
   dropPreset(id: string): Promise<void> {
@@ -269,7 +267,7 @@ export class LibraryStore {
   }
 
   putPlay(record: Play): Promise<void> {
-    return this.put('plays', record.id, record)
+    return this.put('plays', record)
   }
 
   dropPlay(id: string): Promise<void> {
@@ -287,10 +285,11 @@ export class LibraryStore {
   }
 
   putBranch(record: SwipeBranch): Promise<void> {
-    return this.put('branches', branchKey(record.playId, record.key), record)
+    return this.put('branches', record)
   }
 
   dropBranch(playId: string, key: string): Promise<void> {
+    if (!isSafeId(playId) || !isSafeId(key)) return Promise.resolve()
     return this.drop('branches', branchKey(playId, key))
   }
 
@@ -349,6 +348,12 @@ export async function migrateLegacyLibrary(
   const presets = legacy.presets ?? []
   const plays = legacy.plays ?? []
   const branches = legacy.branches ?? []
+  for (const [collection, records] of [
+    ['characters', characters], ['lorebooks', lorebooks], ['presets', presets],
+    ['plays', plays], ['branches', branches],
+  ] as const) {
+    if (!Array.isArray(records)) throw new Error(`tavern library: invalid legacy ${collection}; expected an array; settings copy kept`)
+  }
   const total = characters.length + lorebooks.length + presets.length + plays.length + branches.length
   if (total === 0) {
     return { moved: false, characters: 0, lorebooks: 0, presets: 0, plays: 0, branches: 0 }
@@ -356,16 +361,25 @@ export async function migrateLegacyLibrary(
 
   logger.info(`tavern library: migrating ${total} record(s) out of the settings document`)
   let failures = 0
+  const seen = new Map<Collection, Set<string>>()
   /**
-   * Run one record's write, reporting the failure instead of propagating it.
-   * `label` is a thunk so a MALFORMED record (a `null` entry, a missing id —
-   * exactly what a hand-edited settings document contains) fails inside this
-   * guard rather than while building the message for it.
+   * Validate and reserve each source identity before its write. A repeated id
+   * must not overwrite an earlier source record and then count as two moves.
+   * Malformed records remain guarded here so good records can still recover.
    */
-  const store1 = async (label: () => string, write: () => Promise<void>): Promise<void> => {
-    let name = '(unidentified record)'
+  const store1 = async (
+    collection: Collection,
+    record: unknown,
+    write: () => Promise<void>,
+  ): Promise<void> => {
+    let name = collection as string
     try {
-      name = label()
+      const key = validateLibraryRecord(collection, record)
+      name = `${collection}/${key}`
+      const keys = seen.get(collection) ?? new Set<string>()
+      if (keys.has(key)) throw new Error(`tavern library: duplicate legacy identity ${name}`)
+      keys.add(key)
+      seen.set(collection, keys)
       await write()
     } catch (error: unknown) {
       failures += 1
@@ -373,18 +387,11 @@ export async function migrateLegacyLibrary(
     }
   }
 
-  for (const record of characters) {
-    await store1(() => `character ${String(record?.id)}`, () => store.putCharacter(record))
-  }
-  for (const record of lorebooks) await store1(() => `lorebook ${String(record?.id)}`, () => store.putLorebook(record))
-  for (const record of presets) await store1(() => `preset ${String(record?.id)}`, () => store.putPreset(record))
-  for (const record of plays) await store1(() => `play ${String(record?.id)}`, () => store.putPlay(record))
-  for (const record of branches) {
-    await store1(
-      () => `branch ${String(record?.playId)}/${String(record?.key)}`,
-      () => store.putBranch(record),
-    )
-  }
+  for (const record of characters) await store1('characters', record, () => store.putCharacter(record))
+  for (const record of lorebooks) await store1('lorebooks', record, () => store.putLorebook(record))
+  for (const record of presets) await store1('presets', record, () => store.putPreset(record))
+  for (const record of plays) await store1('plays', record, () => store.putPlay(record))
+  for (const record of branches) await store1('branches', record, () => store.putBranch(record))
 
   if (failures > 0) {
     // Leave the settings copy alone: it is now the only complete copy.

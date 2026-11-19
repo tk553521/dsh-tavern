@@ -29,6 +29,7 @@ import { TavernStorage, newId, nowIso } from './storage.ts'
 import { activateBooks, hashSeed, renderWorldInfo, type ActivatedEntry } from './lorebook.ts'
 import { TAVERN_PRESET_ID } from './tavern-preset.ts'
 import { badRequest, conflict, notFound } from './errors.ts'
+import { comparableForkEvents, sameForkHistory, sameReplyTail, swipeUserMessageId, tailUserMessageId } from './swipe.ts'
 import type { TavernConfig } from './config.ts'
 import {
   buildCharacterSystem, buildClassicSystem, characterProfile, createFence,
@@ -274,6 +275,7 @@ export class TavernSessionRuntime {
   private readonly directorInflight = new Map<string, Promise<AgentHandle>>()
   /** `${playId}:${characterId}` → in-flight role assembly (same race as the director). */
   private readonly roleInflight = new Map<string, Promise<AgentHandle>>()
+  private readonly branchOperations = new Map<string, Promise<unknown>>()
   private closed = false
   private disposal: Promise<void> | undefined
   private readonly playEpochs = new Map<string, number>()
@@ -336,7 +338,7 @@ export class TavernSessionRuntime {
     this.directors.clear()
     this.roles.clear()
     this.speakQueues.clear()
-    const pending = [...this.directorInflight.values(), ...this.roleInflight.values(), ...this.dropInflight.values()]
+    const pending = [...this.directorInflight.values(), ...this.roleInflight.values(), ...this.dropInflight.values(), ...this.branchOperations.values()]
     this.disposal = (async () => {
       const settled = await Promise.allSettled(handles.map(handle => handle.dispose()))
       for (const result of settled) {
@@ -374,6 +376,7 @@ export class TavernSessionRuntime {
    */
   async ensureDirector(play: Play, seedOverride?: readonly SessionEvent[]): Promise<AgentHandle> {
     this.assertActive(play.id)
+    if (this.branchOperations.has(play.id)) throw conflict('会话正在切换，请稍后重试')
     const epoch = this.epoch(play.id)
     const existing = this.directors.get(play.id)
     if (existing !== undefined) return existing
@@ -393,7 +396,7 @@ export class TavernSessionRuntime {
   }
 
   /** The single assembly attempt behind {@link ensureDirector}. */
-  private async createDirector(play: Play, epoch: number, seedOverride?: readonly SessionEvent[]): Promise<AgentHandle> {
+  private async createDirector(play: Play, epoch: number, seedOverride?: readonly SessionEvent[], publish = true): Promise<AgentHandle> {
     const storage = this.deps.storage
     const characters = play.characterIds
       .map(id => storage.getCharacter(id))
@@ -430,24 +433,11 @@ export class TavernSessionRuntime {
     }
     let handle: AgentHandle
     if (persisted.exists) {
-      try {
-        handle = await this.deps.agents.resume({
-          resumeSessionId: sessionId,
-          agentOptions,
-          setup,
-        })
-      } catch (error: unknown) {
-        this.deps.logger.warn(`tavern: resume director failed (${String(error)}); creating fresh session`)
-        handle = await this.deps.agents.create({
-          sessionId,
-          agentOptions,
-          meta: { agentPreset: persisted.preset },
-          setup,
-          ...(play.greeting !== undefined && play.greeting !== ''
-            ? { seed: greetingSeed(play.greeting, model.provider ?? 'default', model.model ?? 'default') }
-            : {}),
-        })
-      }
+      handle = await this.deps.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions,
+        setup,
+      })
     } else {
       // A swipe fork supplies the rebased history verbatim; a brand-new play
       // falls back to its greeting seed.
@@ -464,7 +454,7 @@ export class TavernSessionRuntime {
       })
     }
     return this.completeAssembly(play.id, epoch, handle, sessionId, () => {
-      this.directors.set(play.id, handle)
+      if (publish) this.directors.set(play.id, handle)
     })
   }
 
@@ -502,30 +492,16 @@ export class TavernSessionRuntime {
       // ownership, so it works while the host holds this session for write.
       handle = await this.deps.sessionPersistence.open(sessionId, 'read')
     } catch (error: unknown) {
-      // Only "not found" means "this play has never run". Anything else
-      // (unreadable format, corruption, a backend problem) still describes a
-      // session that exists on disk, so the caller must attempt a resume
-      // rather than a create.
+      // Only a confirmed missing session can start fresh. Preserve storage
+      // errors before assembly; unreadable history must never be recreated.
       if ((error as Error | undefined)?.name === 'SessionPersistenceNotFoundError') {
         return { exists: false, preset: undefined }
       }
-      this.deps.logger.error(
-        'tavern: cannot open stored session "%s" (%s); assuming it exists',
-        String(sessionId),
-        String(error),
-      )
-      return { exists: true, preset: undefined }
+      throw error
     }
     try {
       const { events } = await handle.read()
       return { exists: true, preset: this.recordedPreset(handle.header, events) }
-    } catch (error: unknown) {
-      this.deps.logger.error(
-        'tavern: cannot read stored session "%s" (%s); assuming it exists',
-        String(sessionId),
-        String(error),
-      )
-      return { exists: true, preset: undefined }
     } finally {
       await handle.close().catch(() => {})
     }
@@ -912,21 +888,11 @@ export class TavernSessionRuntime {
     }
     let handle: AgentHandle
     if (persisted.exists) {
-      try {
-        handle = await this.deps.agents.resume({
-          resumeSessionId: sessionId,
-          agentOptions,
-          setup,
-        })
-      } catch (error: unknown) {
-        this.deps.logger.warn(`tavern: resume character failed (${String(error)}); creating fresh session`)
-        handle = await this.deps.agents.create({
-          sessionId,
-          agentOptions,
-          meta: { agentPreset: persisted.preset },
-          setup,
-        })
-      }
+      handle = await this.deps.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions,
+        setup,
+      })
     } else {
       handle = await this.deps.agents.create({
         sessionId,
@@ -959,6 +925,8 @@ export class TavernSessionRuntime {
     this.roles.delete(playId)
     for (const handle of handles) this.speakQueues.delete(String(handle.agent.id))
     const pending: Promise<unknown>[] = []
+    const branchAttempt = this.branchOperations.get(playId)
+    if (branchAttempt !== undefined) pending.push(branchAttempt)
     const directorAttempt = this.directorInflight.get(playId)
     if (directorAttempt !== undefined) pending.push(directorAttempt)
     for (const [key, attempt] of this.roleInflight) {
@@ -980,364 +948,273 @@ export class TavernSessionRuntime {
 
   // ── Retry / swipe / edit (session forks) ────────────────────────────────
 
-  /**
-   * The play session's current event log, live when a director is running.
-   * @param play - the play whose log is read.
-   * @returns the events in seq order.
-   * @throws while a generation is still running (the log is mid-turn).
-   */
-  private async liveEvents(play: Play): Promise<SessionEvent[]> {
-    const handle = this.directors.get(play.id)
-    if (handle !== undefined) {
-      if (handle.agent.status !== 'idle') {
-        throw conflict('角色正在输出中，请先停止或等待其完成')
-      }
-      return [...handle.agent.session.snapshotEvents()]
+  /** Reserve admission synchronously; React state or a disk busy flag is not a lock. */
+  private async withBranchOperation<T>(playId: string, expectedSessionId: string | undefined, task: () => Promise<T>): Promise<T> {
+    this.assertActive(playId)
+    if (this.branchOperations.has(playId) || this.directorInflight.has(playId)) {
+      throw conflict('会话正在恢复或切换，请稍后重试')
     }
-    try {
-      // A stored session is read through a handle in 0.2; `inspect()` is gone.
-      const stored = await this.deps.sessionPersistence.open(play.sessionId as SessionId, 'read')
-      try {
-        const { events } = await stored.read()
-        return [...events]
-      } finally {
-        await stored.close().catch(() => {})
+    const epoch = this.epoch(playId)
+    const run = Promise.resolve().then(() => {
+      this.assertActive(playId, epoch)
+      const play = this.deps.storage.getPlay(playId)
+      if (play === undefined) throw notFound('酒馆会话不存在')
+      if (expectedSessionId !== undefined && expectedSessionId !== play.sessionId) {
+        throw conflict('会话已切换，请刷新后重试')
       }
-    } catch (error: unknown) {
-      // A play whose session was never persisted (created but never spoken to)
-      // has nothing to inspect. That is a caller-visible state, not a server
-      // fault — surfacing it as a 500 told the user nothing.
-      this.deps.logger.warn(`tavern: inspect session "${play.sessionId}" failed: ${String(error)}`)
-      throw badRequest('这场扮演还没有可用的对话记录，请先发送一条消息')
+      const handle = this.directors.get(playId)
+      if (handle !== undefined && (String(handle.agent.id) !== play.sessionId || handle.agent.status !== 'idle'
+        || (handle.agent.inbox?.nextTurn.length ?? 0) > 0 || (handle.agent.inbox?.nextStep.length ?? 0) > 0)) {
+        throw conflict('角色正在输出、仍有待处理输入或会话已切换，请先等待其完成')
+      }
+      return task()
+    })
+    this.branchOperations.set(playId, run)
+    try { return await run } finally {
+      if (this.branchOperations.get(playId) === run) this.branchOperations.delete(playId)
     }
   }
 
-  /**
-   * Move one play onto a fresh DSH session seeded with the given history
-   * (session logs are append-only, so edits and retries fork instead). The
-   * new session resumes under the tavern preset on later restarts like any
-   * other play session.
-   * @param play - the play to rebase.
-   * @param seed - a balanced completed-turn event prefix.
-   * @returns the updated play carrying the new session id.
-   */
-  private async rebasePlaySession(play: Play, seed: readonly SessionEvent[]): Promise<Play> {
-    const old = this.directors.get(play.id)
-    if (old !== undefined) {
-      this.directors.delete(play.id)
-      this.speakQueues.delete(String(old.agent.id))
-      await old.dispose()
+  private async liveEvents(play: Play): Promise<SessionEvent[]> {
+    const handle = this.directors.get(play.id)
+    if (handle !== undefined) {
+      if (handle.agent.status !== 'idle') throw conflict('角色正在输出中，请先停止或等待其完成')
+      return [...handle.agent.session.snapshotEvents()]
     }
-    const rebased: Play = {
-      ...play,
-      sessionId: `tavern-${newId('fork').replace('fork-', '')}`,
-      updatedAt: nowIso(),
-    }
-    await this.deps.storage.upsertPlay(rebased)
-    try {
-      await this.ensureDirector(rebased, seed)
-    } catch (error: unknown) {
-      // The old session log is untouched; restore the pointer so the play
-      // stays usable (the next activate resumes the old session).
-      await this.deps.storage.upsertPlay(play)
+    let stored
+    try { stored = await this.deps.sessionPersistence.open(play.sessionId as SessionId, 'read') } catch (error: unknown) {
+      if ((error as Error | undefined)?.name === 'SessionPersistenceNotFoundError') {
+        throw badRequest('这场扮演还没有可用的对话记录，请先发送一条消息')
+      }
       throw error
+    }
+    try { return [...(await stored.read()).events] } finally { await stored.close().catch(() => {}) }
+  }
+
+  /** Prepare first. A failure before commitment leaves the old handle, pointer and variants usable. */
+  private async rebasePlaySession(
+    play: Play, seed: readonly SessionEvent[], sourceEvents: readonly SessionEvent[],
+    options: {
+      stage?: (next: Play) => Promise<void>
+      rollback?: () => Promise<void>
+      submit?: (agent: Agent) => void
+    } = {},
+  ): Promise<Play> {
+    const epoch = this.epoch(play.id)
+    const old = this.directors.get(play.id)
+    const rebased: Play = { ...play, sessionId: `tavern-${newId('fork').replace('fork-', '')}`, updatedAt: nowIso() }
+    const prepared = await this.createDirector(rebased, epoch, seed, false)
+    let staged = false, pointerWritten = false
+    const checkSource = (): void => {
+      this.assertActive(play.id, epoch)
+      if (old !== undefined && (this.directors.get(play.id) !== old || old.agent.status !== 'idle'
+        || JSON.stringify(old.agent.session.snapshotEvents()) !== JSON.stringify(sourceEvents))) {
+        throw conflict('分叉期间对话已改变，请刷新后重试')
+      }
+    }
+    try {
+      checkSource()
+      // A prefix cut before turn/start can retain the old question's durable
+      // enqueue event. Cancel only inherited pending work in the NEW session,
+      // otherwise retry/edit would submit both the old and replacement question.
+      prepared.agent.inbox?.clear()
+      const current = this.deps.storage.getPlay(play.id)
+      if (current?.sessionId !== play.sessionId || current.updatedAt !== play.updatedAt) {
+        throw conflict('分叉期间会话设置已改变，请刷新后重试')
+      }
+      if (options.stage !== undefined) { staged = true; await options.stage(rebased) }
+      checkSource()
+      await this.deps.storage.upsertPlay(rebased)
+      pointerWritten = true
+      checkSource()
+      // followup commits its inbox synchronously. Reject a submission failure
+      // before dropping old history; no asynchronous work intervenes before publication.
+      options.submit?.(prepared.agent)
+      this.assertActive(play.id, epoch)
+      this.directors.set(play.id, prepared)
+    } catch (error: unknown) {
+      if (pointerWritten) await this.deps.storage.upsertPlay(play).catch(rollbackError => {
+        this.deps.logger.error(`tavern: failed to restore play pointer: ${String(rollbackError)}`)
+      })
+      if (staged) await options.rollback?.().catch(rollbackError => {
+        this.deps.logger.error(`tavern: failed to restore swipe state: ${String(rollbackError)}`)
+      })
+      await prepared.dispose().catch(disposeError => {
+        this.deps.logger.error(`tavern: prepared director disposal failed: ${String(disposeError)}`)
+      })
+      throw error
+    }
+    // Once committed, a cleanup failure must not masquerade as a failed edit.
+    if (old !== undefined) {
+      this.speakQueues.delete(String(old.agent.id))
+      await old.dispose().catch(error => this.deps.logger.warn(`tavern: old director cleanup failed: ${String(error)}`))
     }
     return rebased
   }
 
-  /**
-   * Plan a retry of the last assistant turn: the balanced prefix before the
-   * question turn, the question text to replay, and the current tail.
-   * @param events - the play session's current events.
-   * @returns the reroll plan.
-   */
-  private planReroll(events: readonly SessionEvent[]): {
-    prefix: SessionEvent[]
-    userText: string
-    tail: SessionEvent[]
-  } {
+  private planReroll(events: readonly SessionEvent[]): { prefix: SessionEvent[]; userText: string; tail: SessionEvent[] } {
     let assistantIndex = -1
     for (let i = events.length - 1; i >= 0; i--) {
-      const event = events[i]
-      if (event?.type === 'assistant/message' && event.surfaceOp === 'append') {
-        assistantIndex = i
-        break
-      }
+      if (events[i]?.type === 'assistant/message' && events[i]?.surfaceOp === 'append') { assistantIndex = i; break }
     }
     if (assistantIndex < 0) throw badRequest('当前还没有可重试的回复')
     let turnStart = -1
     for (let i = assistantIndex; i >= 0; i--) {
-      if (events[i]?.type === 'turn/start') {
-        turnStart = i
-        break
-      }
+      if (events[i]?.type === 'turn/start') { turnStart = i; break }
     }
     if (turnStart < 0) throw badRequest('会话日志不完整，无法重试')
-    const prefix = events.slice(0, turnStart)
-    if (prefix.length > 0 && prefix[prefix.length - 1]?.type !== 'turn/end') {
-      throw badRequest('会话日志存在未闭合的轮次，无法重试')
+    const prefix = events.slice(0, turnStart), tail = events.slice(turnStart)
+    if (tail.slice(1).some(event => event.type === 'turn/start')) {
+      throw conflict('当前最后一轮没有可重试回复，请勿切换历史回答')
     }
-    const tail = events.slice(turnStart)
-    let userText = ''
-    for (const event of tail) {
-      if (event?.type !== 'user/message') continue
-      userText = event.data.content
-        .filter((block): block is Extract<typeof block, { type: 'text' }> => block.type === 'text')
-        .map(block => block.text)
-        .join('')
-      if (userText.trim() !== '') break
+    this.assertBalancedPrefix(prefix)
+    if (tail.filter(event => event.type === 'user/message').length !== 1) {
+      throw conflict('当前轮次包含追加输入，重试与切换已暂停以保留原对话')
     }
+    const question = tail.find(event => event.type === 'user/message')
+    const userText = question?.type === 'user/message'
+      ? question.data.content.filter(block => block.type === 'text').map(block => block.text).join('') : ''
     if (userText.trim() === '') throw badRequest('找不到可重放的用户消息')
     return { prefix, userText, tail }
   }
 
-  /**
-   * Regenerate the last assistant reply as a NEW swipe variant: the current
-   * turn tail is stored as one variant, the play is rebased to the shared
-   * prefix, and a fresh generation is kicked off in the background.
-   * @param playId - the play to reroll.
-   * @returns the rebased play and the updated swipe branch (busy).
-   */
-  async reroll(playId: string): Promise<{ play: Play; branch: SwipeBranch }> {
-    const play = this.deps.storage.getPlay(playId)
-    if (play === undefined) throw notFound('酒馆会话不存在')
-    const events = await this.liveEvents(play)
-    const plan = this.planReroll(events)
-    const key = String(plan.prefix.length)
-    const existing = this.deps.storage.getSwipeBranch(playId, key)
-    if (existing?.busy === true) throw conflict('上一次尝试还在生成中，请稍候')
-    // Skip re-appending the current variant when nothing changed since it was
-    // stored — otherwise spamming retry duplicates the same tail endlessly
-    // (the branch variants are persisted in full, so this also bounds their
-    // growth to genuinely distinct attempts).
-    const currentTail = existing?.variants[existing.current] as readonly SessionEvent[] | undefined
-    const lastEvent = (events: readonly SessionEvent[]): SessionEvent | undefined => events[events.length - 1]
-    const sameTail = currentTail !== undefined
-      && currentTail.length === plan.tail.length
-      && lastEvent(currentTail)?.seq === lastEvent(plan.tail)?.seq
-    // The currently displayed turn becomes the newest stored variant; one
-    // empty slot follows for the in-flight generation.
-    const grown = existing === undefined
-      ? [plan.tail, []]
-      : sameTail
-        ? [...existing.variants, []]
-        : [...existing.variants, plan.tail, []]
-    // Every variant is a full event tail on disk, so the list needs a ceiling:
-    // without one, holding down 重试 grows the record without bound. Drop the
-    // oldest attempts; `current` stays the last slot either way.
-    const cap = this.deps.config.maxSwipeVariants
-    const variants = grown.length > cap
-      ? grown.slice(grown.length - cap)
-      : grown
-    const branch: SwipeBranch = {
-      playId,
-      key,
-      prefix: [...plan.prefix],
-      userText: plan.userText,
-      variants,
-      current: variants.length - 1,
-      busy: true,
-      updatedAt: nowIso(),
-    }
-    // Persist the busy flag BEFORE the fork: the flag is the only guard
-    // against a second retry racing the slow session rebase.
-    await this.deps.storage.upsertSwipeBranch(branch)
-    try {
-      const rebased = await this.rebasePlaySession(play, plan.prefix)
-      this.kickSwipeGeneration(rebased, branch)
-      return { play: rebased, branch }
-    } catch (error: unknown) {
-      // Roll the branch back so a failed fork never strands a stuck `busy`.
-      if (existing !== undefined) {
-        await this.deps.storage.upsertSwipeBranch(existing)
-      } else {
-        await this.deps.storage.deleteSwipeBranch(playId, key)
-      }
-      throw error
-    }
+  private assertBalancedPrefix(events: readonly SessionEvent[]): void {
+    const lastBoundary = [...events].reverse().find(event => event.type === 'turn/start' || event.type === 'turn/end')
+    if (lastBoundary?.type === 'turn/start') throw badRequest('会话日志存在未闭合的轮次')
   }
 
-  /**
-   * Drive one swipe generation in the background and record its tail (or
-   * failure) into the branch once the director settles.
-   * @param play - the rebased play.
-   * @param branch - the branch whose `current` slot receives the result.
-   */
-  private kickSwipeGeneration(play: Play, branch: SwipeBranch): void {
-    const handle = this.directors.get(play.id)
-    if (handle === undefined) {
-      // Returning here used to strand `busy: true` forever: nothing would ever
-      // settle the branch, the UI showed "生成中" permanently, and every later
-      // retry was rejected by the busy guard with no way to clear it.
-      void this.settleSwipe(
-        play.id,
-        branch.key,
-        branch.current,
-        () => [],
-        new Error('扮演会话未处于活动状态，无法生成'),
-      )
-      return
-    }
-    const prefixLength = branch.prefix.length
-    const target = branch.current
-    // Capture THIS generation's handle: a concurrent swipe on another branch
-    // rebases the play and replaces the live director, so re-reading
-    // `this.directors.get(playId)` at settle time would record a foreign
-    // session's events into this branch's slot.
-    const readTail = (): SessionEvent[] => [...handle.agent.session.snapshotEvents()].slice(prefixLength)
-    const done = handle.agent.whenIdle()
-    try {
-      handle.agent.followup(userMessage(branch.userText))
-    } catch (error: unknown) {
-      void this.settleSwipe(play.id, branch.key, target, readTail, error)
-      return
-    }
-    void done.then(
-      () => this.settleSwipe(play.id, branch.key, target, readTail),
-      (error: unknown) => this.settleSwipe(play.id, branch.key, target, readTail, error),
-    )
+  async reroll(playId: string, expectedSessionId?: string): Promise<{ play: Play; branch: SwipeBranch }> {
+    return this.withBranchOperation(playId, expectedSessionId, () => this.rerollIdle(playId))
   }
 
-  /**
-   * Record one settled swipe attempt into its branch slot.
-   * @param playId - owning play.
-   * @param key - branch key.
-   * @param index - variant slot to fill.
-   * @param readTail - reader of the settling generation's own session events
-   *   (captured at kick time; immune to later director replacement).
-   * @param error - generation failure, when the drive rejected.
-   */
-  private async settleSwipe(
-    playId: string,
-    key: string,
-    index: number,
-    readTail: () => SessionEvent[],
-    error?: unknown,
-  ): Promise<void> {
-    const branch = this.deps.storage.getSwipeBranch(playId, key)
-    if (branch === undefined) return
-    const tail = error !== undefined ? [] : readTail()
-    const variants = [...branch.variants]
-    if (index >= variants.length) return
-    variants[index] = tail
-    const next: SwipeBranch = {
-      ...branch,
-      variants,
-      current: index,
-      busy: false,
-      updatedAt: nowIso(),
-    }
-    if (error !== undefined) {
-      next.error = error instanceof Error ? error.message : String(error)
-    } else {
-      delete next.error
-    }
-    await this.deps.storage.upsertSwipeBranch(next).catch((saveError: unknown) => {
-      this.deps.logger.warn(`tavern: failed to persist swipe branch: ${String(saveError)}`)
+  private async rerollIdle(playId: string): Promise<{ play: Play; branch: SwipeBranch }> {
+    const play = this.deps.storage.getPlay(playId)!
+    const events = await this.liveEvents(play), plan = this.planReroll(events)
+    // Session.create adds log-only end-seed markers; they must not mint a new branch on every retry.
+    const key = String(comparableForkEvents(plan.prefix).length)
+    const belongs = (branch: SwipeBranch | undefined): branch is SwipeBranch => branch !== undefined
+      && branch.userText === plan.userText && sameForkHistory(branch.prefix, plan.prefix)
+      && (branch.busy || swipeUserMessageId(branch) === tailUserMessageId(plan.tail))
+    const direct = this.deps.storage.getSwipeBranch(playId, key)
+    const legacy = this.deps.storage.getSwipeBranch(playId, String(plan.prefix.length))
+    const existing = belongs(direct) ? direct : belongs(legacy) ? legacy
+      : this.deps.storage.listSwipeBranches(playId).find(belongs)
+    if (existing?.busy) throw conflict('上一次尝试还在生成中，请稍候')
+    const currentTail = existing?.variants[existing.current]
+    const sameTail = currentTail !== undefined && sameForkHistory(currentTail, plan.tail)
+    const grown = existing === undefined ? [plan.tail, []] : sameTail
+      ? [...existing.variants, []] : [...existing.variants, plan.tail, []]
+    const variants = grown.slice(-this.deps.config.maxSwipeVariants)
+    const message = userMessage(plan.userText)
+    let branch: SwipeBranch = { playId, key: existing?.key ?? key, prefix: [...plan.prefix], userText: plan.userText,
+      userMessageId: String(message.id), variants, current: variants.length - 1, busy: true, updatedAt: nowIso() }
+    const rebased = await this.rebasePlaySession(play, plan.prefix, events, {
+      stage: async next => { branch = { ...branch, sessionId: next.sessionId }; await this.deps.storage.upsertSwipeBranch(branch) },
+      rollback: async () => {
+        if (existing !== undefined) await this.deps.storage.upsertSwipeBranch(existing)
+        else await this.deps.storage.deleteSwipeBranch(playId, branch.key)
+      },
+      submit: agent => agent.followup(message),
     })
+    this.observeSwipeGeneration(rebased, branch)
+    return { play: rebased, branch }
   }
 
-  /**
-   * Materialize another stored swipe variant as the play's live session.
-   * @param playId - the play.
-   * @param key - branch key (from the state snapshot's swipe summary).
-   * @param step - relative movement (+1 next, -1 previous, wraps around).
-   * @returns the rebased play and the updated branch.
-   */
-  async swipe(playId: string, key: string, step: number): Promise<{ play: Play; branch: SwipeBranch }> {
-    const play = this.deps.storage.getPlay(playId)
-    if (play === undefined) throw notFound('酒馆会话不存在')
+  private observeSwipeGeneration(play: Play, branch: SwipeBranch): void {
+    const handle = this.directors.get(play.id)!
+    const readTail = (): SessionEvent[] => [...handle.agent.session.snapshotEvents()].slice(branch.prefix.length)
+    void handle.agent.whenIdle().then(
+      () => this.settleSwipe(play.id, branch.key, branch.current, play.sessionId, readTail),
+      (error: unknown) => this.settleSwipe(play.id, branch.key, branch.current, play.sessionId, readTail, error),
+    ).catch(error => this.deps.logger.warn(`tavern: swipe settlement failed: ${String(error)}`))
+  }
+
+  private async settleSwipe(playId: string, key: string, index: number, sessionId: string,
+    readTail: () => SessionEvent[], error?: unknown): Promise<void> {
     const branch = this.deps.storage.getSwipeBranch(playId, key)
-    if (branch === undefined) throw badRequest('这条回复还没有可切换的尝试')
+    if (branch === undefined || branch.sessionId !== sessionId || index >= branch.variants.length) return
+    const tail = error !== undefined ? [] : readTail()
+    const end = [...tail].reverse().find(event => event.type === 'turn/end')
+    if (error === undefined && (end?.type !== 'turn/end'
+      || (end.data.reason.kind !== 'completed' && end.data.reason.kind !== 'max-tokens'))) {
+      error = new Error('本次重试未成功完成')
+    }
+    const variants = [...branch.variants]
+    variants[index] = tail
+    const next: SwipeBranch = { ...branch, variants, current: index, busy: false, updatedAt: nowIso() }
+    if (error !== undefined) next.error = error instanceof Error ? error.message : String(error)
+    else delete next.error
+    await this.deps.storage.upsertSwipeBranch(next)
+  }
+
+  async swipe(playId: string, key: string, step: number, expectedSessionId?: string): Promise<{ play: Play; branch: SwipeBranch }> {
+    return this.withBranchOperation(playId, expectedSessionId, () => this.swipeIdle(playId, key, step))
+  }
+
+  private async swipeIdle(playId: string, key: string, step: number): Promise<{ play: Play; branch: SwipeBranch }> {
+    if (step !== 1 && step !== -1) throw badRequest('移动方向必须为1或-1')
+    const play = this.deps.storage.getPlay(playId)!, branch = this.deps.storage.getSwipeBranch(playId, key)
+    if (branch === undefined || branch.variants.length === 0) throw badRequest('这条回复还没有可切换的尝试')
     if (branch.busy) throw conflict('上一次尝试还在生成中，请稍候')
-    if (branch.variants.length === 0) throw badRequest('这条回复还没有可切换的尝试')
-    const target = ((branch.current + step) % branch.variants.length + branch.variants.length)
-      % branch.variants.length
+    const events = await this.liveEvents(play), plan = this.planReroll(events)
+    if ((branch.sessionId !== undefined && branch.sessionId !== play.sessionId)
+      || tailUserMessageId(plan.tail) !== swipeUserMessageId(branch) || !sameForkHistory(plan.prefix, branch.prefix)
+      || !sameReplyTail(plan.tail, branch.variants[branch.current] ?? [])) {
+      throw conflict('这组尝试不属于当前最后一条回复，请刷新后重试')
+    }
+    const target = (branch.current + step + branch.variants.length) % branch.variants.length
     const tail = branch.variants[target]
     if (tail === undefined || tail.length === 0) throw badRequest('该次尝试还没有内容')
-    const seed = [...branch.prefix, ...structuredClone(tail)] as SessionEvent[]
-    const rebased = await this.rebasePlaySession(play, seed)
-    const next: SwipeBranch = { ...branch, current: target, updatedAt: nowIso() }
-    await this.deps.storage.upsertSwipeBranch(next)
+    let next: SwipeBranch = { ...branch, current: target, userMessageId: tailUserMessageId(tail), updatedAt: nowIso() }
+    const rebased = await this.rebasePlaySession(play, [...branch.prefix, ...structuredClone(tail)] as SessionEvent[], events, {
+      stage: async value => { next = { ...next, sessionId: value.sessionId }; await this.deps.storage.upsertSwipeBranch(next) },
+      rollback: () => this.deps.storage.upsertSwipeBranch(branch),
+    })
     return { play: rebased, branch: next }
   }
 
-  /**
-   * Edit one assistant reply in place: the play's session forks to a copy
-   * whose target message text is replaced. Stale swipe branches are dropped.
-   * @param playId - the play.
-   * @param messageId - the durable assistant message id.
-   * @param text - the new reply text.
-   * @returns the rebased play.
-   */
-  async editAssistant(playId: string, messageId: string, text: string): Promise<Play> {
-    const play = this.deps.storage.getPlay(playId)
-    if (play === undefined) throw notFound('酒馆会话不存在')
-    if (text.trim() === '') throw badRequest('内容不能为空')
-    const events = await this.liveEvents(play)
-    const index = events.findIndex(event =>
-      event.type === 'assistant/message' && String(event.data.message.id) === messageId)
-    if (index < 0) throw notFound('找不到这条回复（可能已被新的尝试替换）')
-    const next = events.map((event, i) => {
-      if (i !== index || event.type !== 'assistant/message') return event
-      return {
-        ...event,
-        data: {
-          ...event.data,
-          message: {
-            ...event.data.message,
-            content: [{ type: 'text' as const, text }],
-          },
-        },
-      }
+  private async retireEditedBranches(playId: string): Promise<void> {
+    await this.deps.storage.deleteSwipeBranches(playId).catch(error => {
+      this.deps.logger.warn(`tavern: stale branch cleanup failed after committed edit: ${String(error)}`)
     })
-    await this.deps.storage.deleteSwipeBranches(playId)
-    return this.rebasePlaySession(play, next)
   }
 
-  /**
-   * Edit one user message: the session is rebased to just before that
-   * message's turn and the edited text is replayed, regenerating the answer.
-   * @param playId - the play.
-   * @param messageId - the user message id.
-   * @param text - the edited message text.
-   * @returns the rebased play (generation continues in the background).
-   */
-  async editUserAndRetry(playId: string, messageId: string, text: string): Promise<Play> {
-    const play = this.deps.storage.getPlay(playId)
-    if (play === undefined) throw notFound('酒馆会话不存在')
+  async editAssistant(playId: string, messageId: string, text: string, expectedSessionId?: string): Promise<Play> {
+    return this.withBranchOperation(playId, expectedSessionId, () => this.editAssistantIdle(playId, messageId, text))
+  }
+
+  private async editAssistantIdle(playId: string, messageId: string, text: string): Promise<Play> {
     if (text.trim() === '') throw badRequest('内容不能为空')
-    const events = await this.liveEvents(play)
-    const index = events.findIndex(event =>
-      event.type === 'user/message' && String(event.data.id) === messageId)
+    const play = this.deps.storage.getPlay(playId)!, events = await this.liveEvents(play)
+    const index = events.findIndex(event => event.type === 'assistant/message' && String(event.data.message.id) === messageId)
+    if (index < 0) throw notFound('找不到这条回复（可能已被新的尝试替换）')
+    const next = events.map((event, i) => i !== index || event.type !== 'assistant/message' ? event : {
+      ...event, data: { ...event.data, message: { ...event.data.message, content: [{ type: 'text' as const, text }] } },
+    })
+    const rebased = await this.rebasePlaySession(play, next, events)
+    await this.retireEditedBranches(playId)
+    return rebased
+  }
+
+  async editUserAndRetry(playId: string, messageId: string, text: string, expectedSessionId?: string): Promise<Play> {
+    return this.withBranchOperation(playId, expectedSessionId, () => this.editUserIdle(playId, messageId, text))
+  }
+
+  private async editUserIdle(playId: string, messageId: string, text: string): Promise<Play> {
+    if (text.trim() === '') throw badRequest('内容不能为空')
+    const play = this.deps.storage.getPlay(playId)!, events = await this.liveEvents(play)
+    const index = events.findIndex(event => event.type === 'user/message' && String(event.data.id) === messageId)
     if (index < 0) throw notFound('找不到这条消息')
     let turnStart = -1
-    for (let i = index; i >= 0; i--) {
-      if (events[i]?.type === 'turn/start') {
-        turnStart = i
-        break
-      }
-    }
+    for (let i = index; i >= 0; i--) if (events[i]?.type === 'turn/start') { turnStart = i; break }
     if (turnStart < 0) throw badRequest('会话日志不完整，无法编辑')
     const prefix = events.slice(0, turnStart)
-    if (prefix.length > 0 && prefix[prefix.length - 1]?.type !== 'turn/end') {
-      throw badRequest('会话日志存在未闭合的轮次，无法编辑')
-    }
-    await this.deps.storage.deleteSwipeBranches(playId)
-    const rebased = await this.rebasePlaySession(play, prefix)
-    const handle = this.directors.get(rebased.id)
-    if (handle !== undefined) {
-      const done = handle.agent.whenIdle()
-      try {
-        handle.agent.followup(userMessage(text))
-      } catch (error: unknown) {
-        this.deps.logger.warn(`tavern: edited-message replay failed: ${String(error)}`)
-        throw error
-      }
-      void done.catch((error: unknown) => {
-        this.deps.logger.warn(`tavern: edited-message turn failed: ${String(error)}`)
-      })
-    }
+    this.assertBalancedPrefix(prefix)
+    const rebased = await this.rebasePlaySession(play, prefix, events, { submit: agent => agent.followup(userMessage(text)) })
+    await this.retireEditedBranches(playId)
+    void this.directors.get(playId)!.agent.whenIdle().catch(error => {
+      this.deps.logger.warn(`tavern: edited-message turn failed: ${String(error)}`)
+    })
     return rebased
   }
 }

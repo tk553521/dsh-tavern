@@ -184,9 +184,10 @@ async function readContainedFile(
  */
 async function runtimeConfiguredUserDir(
   appRoot: string,
+  realAppRoot: string,
 ): Promise<{ userDir?: string; refused: boolean }> {
   const read = await readContainedFile(
-    appRoot,
+    realAppRoot,
     path.join(appRoot, RUNTIME_CONFIG_FILE),
     MAX_RUNTIME_CONFIG_BYTES,
   )
@@ -203,16 +204,22 @@ async function runtimeConfiguredUserDir(
 }
 
 /**
- * Canonicalize the detected directory before handing it out: it becomes the
- * boundary for every later read, and a junction anywhere along the path would
- * survive a comparison made on the unresolved form.
+ * Canonicalize a candidate against the real detection root fixed BEFORE the
+ * candidate is followed. Promoting its own realpath to a new boundary would
+ * let an untrusted data/default-user junction select an unrelated directory.
+ * The root itself may be an explicitly user-selected symlink; its descendants
+ * must still remain inside that selected real root.
  */
 async function resolvedDirectory(
   input: string,
   userDir: string,
   refusedConfigs: string[],
+  realDetectionRoot: string,
 ): Promise<ResolvedTauriTavernDirectory> {
-  const real = await fs.realpath(userDir).catch(() => path.normalize(userDir))
+  const real = await fs.realpath(userDir)
+  if (!isInside(realDetectionRoot, real)) {
+    throw new Error(`TauriTavern 数据目录 ${userDir} 通过软链接 / junction 指向检测根目录之外`)
+  }
   return { input, root: path.dirname(real), userDir: real, refusedConfigs }
 }
 
@@ -241,23 +248,29 @@ export async function resolveTauriTavernDirectory(input: string): Promise<Resolv
   let current = path.normalize(raw)
   while (true) {
     if (await isDirectory(current)) {
+      // Freeze the physical app/data root before examining any descendant.
+      // An escaping candidate fails here instead of being retried under a
+      // wider ancestor whose boundary could accidentally admit the escape.
+      const realCurrent = await fs.realpath(current)
       // A custom data root configured through TauriTavern's
       // tauritavern-runtime.json takes precedence for that app root.
-      const configured = await runtimeConfiguredUserDir(current)
+      const configured = await runtimeConfiguredUserDir(current, realCurrent)
       if (configured.refused) refusedConfigs.push(path.join(current, RUNTIME_CONFIG_FILE))
       if (configured.userDir !== undefined && await isDirectory(configured.userDir)) {
-        return resolvedDirectory(raw, configured.userDir, refusedConfigs)
+        return resolvedDirectory(raw, configured.userDir, refusedConfigs, realCurrent)
       }
 
       const base = path.basename(current).toLowerCase()
       const candidates: string[] = []
-      if (base === DEFAULT_USER_DIR) candidates.push(current)
+      // Explicitly selecting default-user (or an alias/child of it) remains
+      // supported. Only implicitly discovered descendants face containment.
+      if (base === DEFAULT_USER_DIR || path.basename(realCurrent).toLowerCase() === DEFAULT_USER_DIR) candidates.push(current)
       // Prefer the canonical TauriTavern layout `<app>/data/default-user`
       // when both `default-user` and `data/default-user` happen to exist.
       candidates.push(path.join(current, 'data', DEFAULT_USER_DIR))
       candidates.push(path.join(current, DEFAULT_USER_DIR))
       for (const candidate of candidates) {
-        if (await isDirectory(candidate)) return resolvedDirectory(raw, candidate, refusedConfigs)
+        if (await isDirectory(candidate)) return resolvedDirectory(raw, candidate, refusedConfigs, realCurrent)
       }
     }
 
@@ -271,19 +284,25 @@ export async function resolveTauriTavernDirectory(input: string): Promise<Resolv
   // directory, try the standard Tauri app-data locations before giving up.
   if (process.platform === 'win32' && /tauritavern/i.test(path.basename(raw))) {
     const appData = process.env.APPDATA
-    if (appData !== undefined && appData !== '') {
+    if (appData !== undefined && appData !== '' && await isDirectory(appData)) {
+      const realAppData = await fs.realpath(appData)
       for (const name of ['com.tauritavern.client', 'TauriTavern', 'tauritavern']) {
         const base = path.join(appData, name)
-        const configured = await runtimeConfiguredUserDir(base)
+        if (!await isDirectory(base)) continue
+        const realBase = await fs.realpath(base)
+        if (!isInside(realAppData, realBase)) {
+          throw new Error(`TauriTavern 数据目录 ${base} 通过软链接 / junction 指向 APPDATA 检测根目录之外`)
+        }
+        const configured = await runtimeConfiguredUserDir(base, realBase)
         if (configured.refused) refusedConfigs.push(path.join(base, RUNTIME_CONFIG_FILE))
         if (configured.userDir !== undefined && await isDirectory(configured.userDir)) {
-          return resolvedDirectory(raw, configured.userDir, refusedConfigs)
+          return resolvedDirectory(raw, configured.userDir, refusedConfigs, realBase)
         }
         for (const userDir of [
           path.join(base, 'data', DEFAULT_USER_DIR),
           path.join(base, DEFAULT_USER_DIR),
         ]) {
-          if (await isDirectory(userDir)) return resolvedDirectory(raw, userDir, refusedConfigs)
+          if (await isDirectory(userDir)) return resolvedDirectory(raw, userDir, refusedConfigs, realBase)
         }
       }
     }

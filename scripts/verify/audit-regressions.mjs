@@ -52,7 +52,7 @@ test('bulk character persistence exposes failure and still saves other records',
     const library = new LibraryStore(root,logger); await library.load()
     const put = library.putCharacter.bind(library)
     library.putCharacter = record => record.id === 'char-bad' ? Promise.reject(new Error('ENOSPC simulated')) : put(record)
-    await assert.rejects(library.putCharacters([{id:'char-bad'},{id:'char-good'}]), /persist|store|write/i)
+    await assert.rejects(library.putCharacters([{id:'char-bad',card:normalizeCard({name:'Bad'})},{id:'char-good',card:normalizeCard({name:'Good'})}]), /persist|store|write/i)
     assert.ok(library.character('char-good')); assert.equal(library.character('char-bad'),undefined)
   } finally { await rm(root,{recursive:true,force:true}) } // verified mkdtemp fixture
 })

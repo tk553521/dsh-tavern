@@ -89,13 +89,13 @@ export interface TavernApi {
   updatePlay(id: string, patch: Partial<Pick<Play, 'title' | 'lorebookIds' | 'presetId' | 'narratorEnabled' | 'multiAgent' | 'characterIds'>>): Promise<Play>
   deletePlay(id: string): Promise<void>
   /** Regenerate the last assistant reply as a new swipe variant. */
-  retryReply(playId: string): Promise<{ play: Play; branch: SwipeBranchSummary }>
+  retryReply(playId: string, expectedSessionId?: string): Promise<{ play: Play; branch: SwipeBranchSummary }>
   /** Materialize another stored variant of one swipe branch (step ±1). */
-  swipeReply(playId: string, key: string, step: 1 | -1): Promise<{ play: Play; branch: SwipeBranchSummary }>
+  swipeReply(playId: string, key: string, step: 1 | -1, expectedSessionId?: string): Promise<{ play: Play; branch: SwipeBranchSummary }>
   /** Edit one assistant reply in place (forks the session, no regeneration). */
-  editAssistantMessage(playId: string, messageId: string, text: string): Promise<{ play: Play }>
+  editAssistantMessage(playId: string, messageId: string, text: string, expectedSessionId?: string): Promise<{ play: Play }>
   /** Edit one user message and regenerate the answer from it. */
-  editUserMessageAndRetry(playId: string, messageId: string, text: string): Promise<{ play: Play }>
+  editUserMessageAndRetry(playId: string, messageId: string, text: string, expectedSessionId?: string): Promise<{ play: Play }>
   setDefaultPreset(id: string | undefined): Promise<void>
   /** Persist the tavern view style preference. */
   setStyle(style: TavernStyle): Promise<void>
@@ -165,21 +165,21 @@ function api(): TavernApi {
     deletePlay: async (id) => {
       await request(`/tavern/plays/${encodeURIComponent(id)}`, { method: 'DELETE' })
     },
-    retryReply: (playId) => request(`/tavern/plays/${encodeURIComponent(playId)}/messages/retry`, {
+    retryReply: (playId, expectedSessionId) => request(`/tavern/plays/${encodeURIComponent(playId)}/messages/retry`, {
       method: 'POST',
-      body: '{}',
+      body: JSON.stringify({ expectedSessionId }),
     }),
-    swipeReply: (playId, key, step) => request(`/tavern/plays/${encodeURIComponent(playId)}/messages/swipe`, {
+    swipeReply: (playId, key, step, expectedSessionId) => request(`/tavern/plays/${encodeURIComponent(playId)}/messages/swipe`, {
       method: 'POST',
-      body: JSON.stringify({ key, step }),
+      body: JSON.stringify({ key, step, expectedSessionId }),
     }),
-    editAssistantMessage: (playId, messageId, text) => request(
+    editAssistantMessage: (playId, messageId, text, expectedSessionId) => request(
       `/tavern/plays/${encodeURIComponent(playId)}/messages/${encodeURIComponent(messageId)}`,
-      { method: 'PUT', body: JSON.stringify({ text }) },
+      { method: 'PUT', body: JSON.stringify({ text, expectedSessionId }) },
     ),
-    editUserMessageAndRetry: (playId, messageId, text) => request(
+    editUserMessageAndRetry: (playId, messageId, text, expectedSessionId) => request(
       `/tavern/plays/${encodeURIComponent(playId)}/messages/${encodeURIComponent(messageId)}/retry`,
-      { method: 'POST', body: JSON.stringify({ text }) },
+      { method: 'POST', body: JSON.stringify({ text, expectedSessionId }) },
     ),
     setDefaultPreset: async (defaultPresetId) => {
       await request('/tavern/settings', {

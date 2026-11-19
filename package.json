@@ -41,7 +41,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.host.json && tsc --noEmit -p tsconfig.client.json",
     "verify": "tsdown && node scripts/verify/library.mjs && node scripts/verify/lorebook.mjs && node scripts/verify/prompt.mjs && node scripts/verify/seed.mjs && node scripts/verify/plugin.mjs && npm run verify:regressions",
     "verify:ci": "tsdown && node scripts/verify/library.mjs && node scripts/verify/lorebook.mjs && node scripts/verify/prompt.mjs && npm run verify:regressions && node scripts/ci/check-host-bundle.mjs",
-    "verify:regressions": "node --experimental-transform-types scripts/verify/data-regressions.mjs && node scripts/verify/codec-config-regressions.mjs && node --experimental-transform-types scripts/verify/api-regressions.mjs && node scripts/verify/runtime-regressions.mjs && node --experimental-transform-types scripts/verify/audit-regressions.mjs",
+    "verify:regressions": "node --experimental-transform-types scripts/verify/data-regressions.mjs && node scripts/verify/codec-config-regressions.mjs && node --experimental-transform-types scripts/verify/api-regressions.mjs && node scripts/verify/runtime-regressions.mjs && node --experimental-transform-types scripts/verify/audit-regressions.mjs && npm run verify:stability",
+    "verify:stability": "node --experimental-transform-types scripts/verify/stability-runtime-regressions.mjs && node --experimental-transform-types scripts/verify/stability-api-regressions.mjs && node --experimental-transform-types scripts/verify/stability-data-regressions.mjs && node --experimental-transform-types scripts/verify/stability-client-regressions.mjs",
     "prepare": "npm run build"
   },
   "keywords": [
