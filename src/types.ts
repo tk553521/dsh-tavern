@@ -277,6 +277,10 @@ export interface SwipeBranch {
   prefix: unknown[]
   /** The user message text replayed when a variant is generated. */
   userText: string
+  /** Durable ordinary user message of the currently selected/planned attempt. */
+  userMessageId?: string
+  /** Director session in which the current attempt is materialized. */
+  sessionId?: string
   /**
    * One event tail per attempt, from the question turn's `turn/start` through
    * its `turn/end`. An empty array marks an in-flight generation.
@@ -298,6 +302,8 @@ export interface SwipeBranchSummary {
   count: number
   current: number
   busy: boolean
+  userMessageId?: string
+  sessionId?: string
   error?: string
   updatedAt: string
 }

@@ -3,11 +3,12 @@
  * snapshot), composer, and play creation. The conversation itself is the
  * DSH session — sending routes through the conversation service.
  */
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { PlaySummary, SwipeBranchSummary } from '../../types.ts'
 import type { TavernApi } from '../api.ts'
 import { avatarSrc } from '../avatar.ts'
-import type { ViewMessage } from '../TavernView.tsx'
+import { operationBlockReason, replySeat, type ComposerDrafts, type MessageEditor, type OperationAddress } from '../stability.ts'
+import type { ViewMessage } from '../messages.ts'
 import css from '../TavernView.module.css'
 import { Button, Empty, Field, Select, Spinner, confirmAction } from './common.tsx'
 
@@ -30,6 +31,7 @@ export interface LorebookChoice {
 
 export interface ChatPanelProps {
   api: TavernApi
+  composerDrafts: ComposerDrafts
   plays: PlaySummary[]
   characters: CharacterChoice[]
   lorebooks: LorebookChoice[]
@@ -55,9 +57,9 @@ export interface ChatPanelProps {
   /** Abort the in-flight generation. */
   onCancel: () => void
   /** Save an edited assistant reply (in place). */
-  onEditAssistant: (messageId: string, text: string) => void
+  onEditAssistant: (messageId: string, text: string) => Promise<void>
   /** Save an edited user message and regenerate from it. */
-  onEditUserRetry: (messageId: string, text: string) => void
+  onEditUserRetry: (messageId: string, text: string) => Promise<void>
   onCreatePlay: (
     title: string,
     characterIds: string[],
@@ -67,7 +69,7 @@ export interface ChatPanelProps {
     multiAgent: boolean,
   ) => Promise<void>
   onDeletePlay: (id: string) => Promise<void>
-  onSend: (content: string) => Promise<void>
+  onSend: (content: string, expected: OperationAddress) => Promise<void>
   /** Open the character library when the user has no cards to pick from. */
   onGoToCharacters: () => void
   /** Open the world-book library when no books are available. */
@@ -225,8 +227,17 @@ export function looksLikeHtml(text: string): boolean {
 }
 
 export function ChatPanel(props: ChatPanelProps) {
-  const { running } = props
-  const [draft, setDraft] = useState('')
+  const { running, composerDrafts } = props
+  useSyncExternalStore(composerDrafts.subscribe, composerDrafts.getSnapshot)
+  const composerDraft = composerDrafts.get(props.activePlayId)
+  const draft = composerDraft.text
+  const activePlay = props.plays.find(play => play.id === props.activePlayId)
+  const address: OperationAddress = { playId: props.activePlayId, sessionId: activePlay?.sessionId }
+  const inPlaySession = activePlay !== undefined && props.activeSessionId === activePlay.sessionId
+  const blocked = operationBlockReason({
+    ...address, boundSessionId: props.activeSessionId, running,
+    busy: props.branching || props.swipe?.busy === true,
+  })
   const [title, setTitle] = useState('')
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [characterQuery, setCharacterQuery] = useState('')
@@ -350,39 +361,22 @@ export function ChatPanel(props: ChatPanelProps) {
   }
 
   const send = (): void => {
-    const content = draft.trim()
-    if (content === '' || running) return
-    // Clear optimistically so the composer feels instant, but a rejected send
-    // means the text never reached the session: hand it back instead of
-    // destroying it. Only refill an untouched composer — the user may have
-    // started typing the next line while the failing send was in flight, and
-    // that draft outranks the one we are returning.
-    setDraft('')
-    void props.onSend(content).catch(() => {
-      setDraft(prev => (prev === '' ? content : prev))
-    })
+    if (blocked !== undefined) return
+    // The ticket owns A's text and revision even if the view switches to B.
+    // begin clears synchronously, closing the double-Enter render window too.
+    const pending = composerDrafts.begin(address.playId)
+    if (pending === undefined) return
+    void props.onSend(pending.content, address).catch(error => composerDrafts.fail(pending, error))
   }
 
-  // Resolve the retry/swipe seat once per transcript instead of re-scanning the
-  // tail from inside the row map: that scan was O(n²) and reran on every
-  // streamed token. Equivalent to the old per-row predicate — the seat is the
-  // row with no assistant row after it, and only once it has settled.
-  const lastAssistantIndex = useMemo(() => {
-    for (let index = props.messages.length - 1; index >= 0; index -= 1) {
-      if (props.messages[index]!.kind === 'assistant') return index
-    }
-    return -1
-  }, [props.messages])
+  // Only the current tail reply owns retry/swipe controls. A new user row
+  // removes the old seat before the running subscription catches up.
+  const lastAssistantIndex = useMemo(() => replySeat(props.messages).assistantIndex, [props.messages])
 
-  // MessageRow is memoized, so every callback it receives has to survive a
-  // re-render identical or the memo never hits. Rows hand their own address up
-  // instead of each one closing over its message.
-  const saveEdit = useCallback((messageId: string, kind: ViewMessage['kind'], text: string): void => {
-    if (kind === 'user') props.onEditUserRetry(messageId, text)
-    else props.onEditAssistant(messageId, text)
-  }, [props.onEditUserRetry, props.onEditAssistant])
-
-  const inPlaySession = props.activeSessionId !== undefined
+  // Rows report their own durable address; save completion remains observable.
+  const saveEdit = useCallback((messageId: string, kind: ViewMessage['kind'], text: string): Promise<void> => (
+    kind === 'user' ? props.onEditUserRetry(messageId, text) : props.onEditAssistant(messageId, text)
+  ), [props.onEditUserRetry, props.onEditAssistant])
 
   return (
     <div className={css.body}>
@@ -743,10 +737,11 @@ export function ChatPanel(props: ChatPanelProps) {
               )}
               {props.messages.map((message, index) => (
                 <MessageRow
-                  key={message.id}
+                  key={`${props.activePlayId}:${activePlay?.sessionId}:${message.id}`}
                   message={message}
+                  editor={composerDrafts.editor(props.activePlayId!, message.id)}
                   isLastAssistant={index === lastAssistantIndex && message.status !== 'streaming'}
-                  busy={props.branching}
+                  busy={props.branching || !inPlaySession || props.swipe?.busy === true}
                   running={running}
                   swipe={props.swipe}
                   onRetry={props.onRetry}
@@ -760,10 +755,11 @@ export function ChatPanel(props: ChatPanelProps) {
               <div className={css.composerRow}>
                 <textarea
                   className={css.composerInput}
+                  aria-label="发送给当前酒馆会话的消息"
                   value={draft}
                   placeholder={inPlaySession ? '对角色说话…' : '请先在左侧选择一个酒馆会话'}
-                  disabled={running || !inPlaySession}
-                  onChange={event => setDraft(event.target.value)}
+                  disabled={blocked !== undefined}
+                  onChange={event => composerDrafts.set(address.playId, event.target.value)}
                   onKeyDown={event => {
                     // Enter also commits an IME candidate: a Chinese/Japanese
                     // user pressing it to pick a character must not send the
@@ -789,13 +785,26 @@ export function ChatPanel(props: ChatPanelProps) {
                   <button
                     type="button"
                     className={css.sendBtn}
-                    disabled={props.branching || draft.trim() === '' || !inPlaySession}
+                    disabled={blocked !== undefined || draft.trim() === ''}
+                    title={blocked}
                     onClick={send}
                   >
-                    发送
+                    {props.branching ? '处理中…' : '发送'}
                   </button>
                 )}
               </div>
+              {(composerDraft.error !== undefined || composerDraft.failures.length > 0) && (
+                <div className={css.msgActions}>
+                  <span className={css.msgStatusError} role="alert">
+                    {composerDraft.error !== undefined ? `发送失败：${composerDraft.error}；内容已保留。` : '仍有未发送的内容已保留。'}
+                  </span>
+                  {composerDraft.failures.length > 0 && (
+                    <Button variant="ghost" disabled={blocked !== undefined} onClick={() => composerDrafts.recover(address.playId)}>
+                      追加失败内容到草稿（{composerDraft.failures.length}）
+                    </Button>
+                  )}
+                </div>
+              )}
               <div className={css.modeRow}>
                 <span>聊天通过 DSH 会话进行：回复会记录在会话日志（轨迹）中；酒馆会话只显示在本页，不会出现在「对话」页。</span>
               </div>
@@ -851,6 +860,8 @@ function StatusLine(props: { message: ViewMessage }) {
 
 interface MessageRowProps {
   message: ViewMessage
+  /** View-owned, addressed by play and stable speaker-row id across remounts. */
+  editor: MessageEditor
   /** Whether this row is the final settled assistant reply (retry/swipe seat). */
   isLastAssistant: boolean
   busy: boolean
@@ -859,7 +870,7 @@ interface MessageRowProps {
   onRetry: () => void
   onSwipe: (step: 1 | -1) => void
   /** Save an edit; the row reports its own address so the parent needs no closure. */
-  onSaveEdit: (messageId: string, kind: ViewMessage['kind'], text: string) => void
+  onSaveEdit: (messageId: string, kind: ViewMessage['kind'], text: string) => Promise<void>
 }
 
 /**
@@ -871,7 +882,8 @@ interface MessageRowProps {
 function sameMessageRow(prev: MessageRowProps, next: MessageRowProps): boolean {
   const a = prev.message
   const b = next.message
-  return prev.isLastAssistant === next.isLastAssistant
+  return prev.editor === next.editor
+    && prev.isLastAssistant === next.isLastAssistant
     && prev.busy === next.busy
     && prev.running === next.running
     && prev.swipe === next.swipe
@@ -886,21 +898,22 @@ function sameMessageRow(prev: MessageRowProps, next: MessageRowProps): boolean {
     && a.status === b.status
     && a.errorText === b.errorText
     && a.messageId === b.messageId
+    && a.userMessageId === b.userMessageId
     && a.stepText === b.stepText
 }
 
 const MessageRow = memo(function MessageRow(props: MessageRowProps) {
-  const { message } = props
-  const [editing, setEditing] = useState(false)
-  const [draft, setDraft] = useState('')
+  const { message, editor } = props
+  const { editing, draft, saving, error: editError } = useSyncExternalStore(editor.subscribe, editor.getSnapshot)
   const cls = message.kind === 'user'
     ? `${css.msg} ${css.msgUser}`
     : message.name === undefined
       ? `${css.msg} ${css.msgNarrator}`
       : css.msg
-  const canEdit = message.messageId !== undefined && !props.running && !props.busy
-  const showSwipe = props.isLastAssistant && props.swipe !== undefined && props.swipe.count > 1
-  const showRetry = props.isLastAssistant && !props.running
+  const editorBusy = props.running || props.busy || saving
+  const canEdit = message.messageId !== undefined && !editorBusy
+  const showSwipe = props.isLastAssistant && !props.running && props.swipe !== undefined && props.swipe.count > 1
+  const showRetry = props.isLastAssistant && !props.running && message.messageId !== undefined
   const streaming = message.status === 'streaming'
   // Rich rendering is per message and conditional twice over: the text has to
   // look like markup, and the sanitizer has to vouch for its own output (null
@@ -912,10 +925,15 @@ const MessageRow = memo(function MessageRow(props: MessageRowProps) {
   )
 
   const startEdit = (): void => {
-    // Edits address the whole assistant step, so seed from the step text when
-    // the row is only one speaker's slice of it.
-    setDraft(message.stepText ?? message.text)
-    setEditing(true)
+    if (!canEdit) return
+    // Edits address the whole assistant step, not only one speaker's slice.
+    editor.open(message.stepText ?? message.text)
+  }
+
+  const submitEdit = (): void => {
+    if (!canEdit || message.messageId === undefined) return
+    const messageId = message.messageId
+    void editor.save(text => props.onSaveEdit(messageId, message.kind, text))
   }
 
   return (
@@ -927,39 +945,38 @@ const MessageRow = memo(function MessageRow(props: MessageRowProps) {
       {message.thinking !== undefined && (
         <ThinkingBlock text={message.thinking} streaming={streaming} />
       )}
-      {message.text !== '' && (editing ? (
-        <div className={css.editArea}>
+      {editing ? (
+        <div className={css.editArea} aria-busy={saving}>
           <textarea
             className={css.editInput}
+            aria-label={message.kind === 'user' ? '编辑用户消息' : '编辑助手回复'}
             value={draft}
             rows={Math.min(12, draft.split('\n').length + 1)}
-            disabled={props.busy}
-            onChange={event => setDraft(event.target.value)}
+            disabled={editorBusy}
+            onChange={event => editor.change(event.target.value)}
           />
           <div className={css.msgActions}>
             <Button
               variant="primary"
-              disabled={props.busy || draft.trim() === ''}
-              onClick={() => {
-                if (message.messageId !== undefined) {
-                  props.onSaveEdit(message.messageId, message.kind, draft.trim())
-                }
-                setEditing(false)
-              }}
+              disabled={editorBusy || draft.trim() === '' || message.messageId === undefined}
+              onClick={submitEdit}
             >
-              {message.kind === 'user' ? '保存并重新生成' : '保存'}
+              {saving ? '保存中…' : message.kind === 'user' ? '保存并重新生成' : '保存'}
             </Button>
-            <Button variant="ghost" disabled={props.busy} onClick={() => setEditing(false)}>取消</Button>
+            <Button variant="ghost" disabled={editorBusy} onClick={() => editor.cancel()}>取消</Button>
           </div>
+          {editError !== undefined && (
+            <span className={css.msgStatusError} role="alert">保存失败：{editError}；修改内容已保留，请重试。</span>
+          )}
         </div>
-      ) : richHtml !== null ? (
+      ) : message.text === '' ? null : richHtml !== null ? (
         <div
           className={`${css.msgBubble} ${css.msgRich}`}
           dangerouslySetInnerHTML={{ __html: richHtml }}
         />
       ) : (
         <div className={css.msgBubble}>{message.text}</div>
-      ))}
+      )}
       <StatusLine message={message} />
       {!editing && (showRetry || canEdit) && (
         <div className={css.msgActions}>

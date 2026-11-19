@@ -8,6 +8,7 @@ import { LibraryStore } from '../../src/library.ts'
 import { AvatarStore } from '../../src/avatarstore.ts'
 import { TavernStorage } from '../../src/storage.ts'
 import { importTauriTavernData } from '../../src/tauritavern.ts'
+import { normalizeCard } from '../../src/cardcodec.ts'
 const logger = { warn() {}, error() {}, info() {} }
 
 test('concurrent preference patches preserve independent fields after reload', async () => {
@@ -50,9 +51,9 @@ test('deleting a record waits for earlier saves and it stays deleted after reloa
   try {
     const library = new LibraryStore(root, logger)
     await library.load()
-    await library.putCharacter({ id: 'char-a', name: 'old' })
+    await library.putCharacter({ id: 'char-a', name: 'old', card: normalizeCard({ name: 'Old' }) })
     const saves = Array.from({ length: 20 }, (_, i) => library.putCharacter({
-      id: 'char-a', name: `save${i}`, card: { data: { description: 'x'.repeat(65536) } },
+      id: 'char-a', name: `save${i}`, card: normalizeCard({ name: `Save ${i}`, description: 'x'.repeat(65536) }),
     }))
     await library.dropCharacter('char-a')
     await Promise.all(saves)
@@ -60,7 +61,7 @@ test('deleting a record waits for earlier saves and it stays deleted after reloa
     const reload = new LibraryStore(root, logger)
     await reload.load()
     assert.equal(reload.character('char-a'), undefined)
-    await library.putCharacter({ id: 'char-a', name: 'new' })
+    await library.putCharacter({ id: 'char-a', name: 'new', card: normalizeCard({ name: 'New' }) })
     assert.equal(library.character('char-a').name, 'new')
   } finally {
     await rm(root, { recursive: true, force: true })
